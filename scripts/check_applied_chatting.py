@@ -15,6 +15,7 @@ disagree, it says so loudly -- that mismatch is the actual bug, and it is invisi
 
 Exit code is 0 only if every template source present has the terseness prompt applied.
 """
+
 from __future__ import annotations
 
 import json
@@ -32,8 +33,11 @@ def render(src: str, msgs: list[dict], **kw) -> str:
         from jinja2 import Environment
     except ImportError:
         sys.exit("needs jinja2:  pip install jinja2")
-    return Environment().from_string(src).render(
-        messages=msgs, add_generation_prompt=True, **kw)
+    return (
+        Environment()
+        .from_string(src)
+        .render(messages=msgs, add_generation_prompt=True, **kw)
+    )
 
 
 def render_probe(src: str) -> tuple:
@@ -44,15 +48,20 @@ def render_probe(src: str) -> tuple:
         ([{"role": "system", "content": SYSTEM_PROBE}] + user, {}),
         (user, {"enable_thinking": False}),
         (user, {"reasoning_effort": "low"}),
-        ([{"role": "user", "content": "Q1"},
-          {"role": "assistant", "content": f"<think>{THINK_PROBE}</think>A1"},
-          {"role": "user", "content": "Q2"}], {}),
+        (
+            [
+                {"role": "user", "content": "Q1"},
+                {"role": "assistant", "content": f"<think>{THINK_PROBE}</think>A1"},
+                {"role": "user", "content": "Q2"},
+            ],
+            {},
+        ),
     ]
     out = []
     for msgs, kw in cases:
         try:
             out.append(render(src, msgs, **kw))
-        except Exception as e:                 # a template that throws differs from one that does not
+        except Exception as e:  # a template that throws differs from one that does not
             out.append(f"__ERROR__{type(e).__name__}")
     return tuple(out)
 
@@ -67,26 +76,35 @@ def think_kept(rendered: str) -> bool:
     living inside a think block, not on either literal tag layout. A stock template drops
     the reasoning entirely and fails both.
     """
-    return any(THINK_PROBE in blk
-               for blk in re.findall(r"<think>(.*?)</think>", rendered, re.DOTALL))
+    return any(
+        THINK_PROBE in blk
+        for blk in re.findall(r"<think>(.*?)</think>", rendered, re.DOTALL)
+    )
 
 
 def describe(src: str) -> dict:
     """Render the cases that matter and report what the template does."""
     user = [{"role": "user", "content": "hi"}]
-    with_sys = [{"role": "system", "content": SYSTEM_PROBE}, {"role": "user", "content": "hi"}]
-    multi = [{"role": "user", "content": "Q1"},
-             {"role": "assistant", "content": f"<think>{THINK_PROBE}</think>A1"},
-             {"role": "user", "content": "Q2"}]
+    with_sys = [
+        {"role": "system", "content": SYSTEM_PROBE},
+        {"role": "user", "content": "hi"},
+    ]
+    multi = [
+        {"role": "user", "content": "Q1"},
+        {"role": "assistant", "content": f"<think>{THINK_PROBE}</think>A1"},
+        {"role": "user", "content": "Q2"},
+    ]
     try:
         plain, sysd, mt = render(src, user), render(src, with_sys), render(src, multi)
-    except Exception as e:                       # a template that won't render is its own answer
+    except Exception as e:  # a template that won't render is its own answer
         return {"error": f"{type(e).__name__}: {e}"}
     return {
         "terse_count": plain.count(MARKER),
         "keeps_system": SYSTEM_PROBE in sysd,
         "retains_think": think_kept(mt),
-        "identity": next((n for n in ("Nail-35b-a3b", "Dagger-27b") if n in plain), None),
+        "identity": next(
+            (n for n in ("Nail-35b-a3b", "Dagger-27b") if n in plain), None
+        ),
         "bytes": len(src),
     }
 
@@ -103,10 +121,14 @@ def report(label: str, src: str) -> bool:
     print(f"     keeps your system prompt . {'yes' if d['keeps_system'] else 'NO'}")
     # Heuristic: a template that simply echoes message content will "pass" this without
     # implementing retention at all. Reliable as a NO, only suggestive as a yes.
-    print(f"     retains thinking* ........ {'yes' if d['retains_think'] else 'no'}"
-          f"{'' if d['retains_think'] else '  (stock behaviour, not froggeric-fixed)'}")
+    print(
+        f"     retains thinking* ........ {'yes' if d['retains_think'] else 'no'}"
+        f"{'' if d['retains_think'] else '  (stock behaviour, not froggeric-fixed)'}"
+    )
     if d["identity"]:
-        print(f"     WARNING: names a specific model ({d['identity']}) — you probably want the")
+        print(
+            f"     WARNING: names a specific model ({d['identity']}) — you probably want the"
+        )
         print(f"              model-agnostic template from this repo instead")
     return ok
 
@@ -137,8 +159,10 @@ def main() -> int:
     if target.is_file() and target.suffix == ".gguf":
         tpl = from_gguf(target)
         if tpl is None:
-            print("\n  no tokenizer.chat_template embedded — llama.cpp will fall back to a\n"
-                  "  built-in template, and the terseness prompt is NOT applied.")
+            print(
+                "\n  no tokenizer.chat_template embedded — llama.cpp will fall back to a\n"
+                "  built-in template, and the terseness prompt is NOT applied."
+            )
             return 1
         sources["embedded in .gguf"] = tpl
     else:
@@ -170,18 +194,34 @@ def main() -> int:
         print()
         if not differing:
             same_text = len({sources[n] for n in names}) == 1
-            print("  Both sources render the SAME prompts — whichever your runtime prefers,")
-            print("  you get the same behaviour" + ("." if same_text else
-                  " (they differ only as full vs. minified text)."))
+            print(
+                "  Both sources render the SAME prompts — whichever your runtime prefers,"
+            )
+            print(
+                "  you get the same behaviour"
+                + (
+                    "."
+                    if same_text
+                    else " (they differ only as full vs. minified text)."
+                )
+            )
         else:
             ok = False
             print("  *** THE TWO SOURCES DISAGREE ***")
-            print("  Recent transformers uses chat_template.jinja; oMLX and others read the")
-            print("  copy embedded in tokenizer_config.json. Right now those RENDER DIFFERENTLY,")
-            print("  so what you get depends on your runtime. Patch both to the same template.")
+            print(
+                "  Recent transformers uses chat_template.jinja; oMLX and others read the"
+            )
+            print(
+                "  copy embedded in tokenizer_config.json. Right now those RENDER DIFFERENTLY,"
+            )
+            print(
+                "  so what you get depends on your runtime. Patch both to the same template."
+            )
 
-    print("\n  * retention is inferred from the rendered output; a template that merely echoes"
-          "\n    message content passes it without implementing retention. Trust the 'no'.")
+    print(
+        "\n  * retention is inferred from the rendered output; a template that merely echoes"
+        "\n    message content passes it without implementing retention. Trust the 'no'."
+    )
     print("\n" + ("APPLIED" if ok else "NOT APPLIED (or inconsistent) — see above"))
     return 0 if ok else 1
 

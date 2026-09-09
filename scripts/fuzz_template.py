@@ -32,6 +32,7 @@ Usage:
 
 Exits nonzero on any invariant failure and prints a JSON repro for each.
 """
+
 import argparse
 import json
 import os
@@ -43,55 +44,69 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 # Alphabet deliberately excludes every error-detector keyword, control-tag
 # fragment, and special-token prefix so invariant 7 stays two-sided.
-WORDS = ['alpha', 'bravo', 'delta', 'gamma', 'lumen', 'quartz', 'river',
-         'stone', 'matrix', 'vector', 'naïve', 'café', '数据', '結果']
+WORDS = [
+    "alpha",
+    "bravo",
+    "delta",
+    "gamma",
+    "lumen",
+    "quartz",
+    "river",
+    "stone",
+    "matrix",
+    "vector",
+    "naïve",
+    "café",
+    "数据",
+    "結果",
+]
 
 
 def _phrase(rnd, lo=2, hi=5):
-    sep = '\n' if rnd.random() < 0.1 else ' '
-    return sep.join(rnd.choice(WORDS) + str(rnd.randint(0, 99))
-                    for _ in range(rnd.randint(lo, hi)))
+    sep = "\n" if rnd.random() < 0.1 else " "
+    return sep.join(
+        rnd.choice(WORDS) + str(rnd.randint(0, 99)) for _ in range(rnd.randint(lo, hi))
+    )
 
 
 def _gen_case(rnd):
     kwargs = {}
-    fmt = 'json' if rnd.random() < 0.3 else 'xml'
-    if fmt == 'json':
-        kwargs['tool_call_format'] = 'json'
+    fmt = "json" if rnd.random() < 0.3 else "xml"
+    if fmt == "json":
+        kwargs["tool_call_format"] = "json"
     if rnd.random() < 0.3:
-        kwargs['reasoning_effort'] = rnd.choice(['low', 'medium', 'high', 'xhigh'])
+        kwargs["reasoning_effort"] = rnd.choice(["low", "medium", "high", "xhigh"])
     no_think = rnd.random() < 0.15
     if no_think:
-        kwargs['enable_thinking'] = False
+        kwargs["enable_thinking"] = False
     preserve = True
     if rnd.random() < 0.2:
-        kwargs['preserve_thinking'] = False
+        kwargs["preserve_thinking"] = False
         preserve = False
     if rnd.random() < 0.2:
-        kwargs['add_vision_id'] = True
+        kwargs["add_vision_id"] = True
     trunc_args = False
-    if fmt == 'xml' and rnd.random() < 0.2:
-        kwargs['max_tool_arg_chars'] = rnd.choice([8, 40])
+    if fmt == "xml" and rnd.random() < 0.2:
+        kwargs["max_tool_arg_chars"] = rnd.choice([8, 40])
         trunc_args = True
-    if fmt == 'xml' and rnd.random() < 0.15:
-        kwargs['max_tool_response_chars'] = 80
+    if fmt == "xml" and rnd.random() < 0.15:
+        kwargs["max_tool_response_chars"] = 80
 
     msgs = []
     user_texts, answers, reasonings, xml_keys, xml_vals = [], [], [], [], []
     planted_error = False
 
     for _ in range(rnd.randint(0, 2)):
-        msgs.append({'role': 'system', 'content': _phrase(rnd)})
+        msgs.append({"role": "system", "content": _phrase(rnd)})
 
     for _ in range(rnd.randint(1, 3)):
         text = _phrase(rnd)
         if rnd.random() < 0.25:
-            parts = [{'type': 'image', 'image': 'x'}
-                     for _ in range(rnd.randint(1, 2))]
-            parts.append({'type': 'text', 'text': text})
-            msgs.append({'role': 'user', 'content': parts})
+            parts = [{"type": "image", "image": "x"} for _ in range(rnd.randint(1, 2))]
+            parts.append({"type": "text", "text": text})
+            msgs.append({"role": "user", "content": parts})
         else:
-            msgs.append({'role': 'user', 'content': text})
+            msgs.append({"role": "user", "content": text})
         user_texts.append(text)
 
         for _ in range(rnd.randint(0, 2)):
@@ -100,163 +115,215 @@ def _gen_case(rnd):
                 roll = rnd.random()
                 if roll < 0.5:
                     value = _phrase(rnd)
-                    args = {'k%d' % c: value}
-                    xml_keys.append('k%d' % c)
-                    if fmt == 'xml' and not trunc_args:
+                    args = {"k%d" % c: value}
+                    xml_keys.append("k%d" % c)
+                    if fmt == "xml" and not trunc_args:
                         xml_vals.append(value)
                 elif roll < 0.7:
-                    args = json.dumps({'q': _phrase(rnd)})
+                    args = json.dumps({"q": _phrase(rnd)})
                 elif roll < 0.8:
                     args = rnd.randint(0, 999)
                 elif roll < 0.9:
                     args = [1, 2, 3]
                 else:
                     args = {}
-                fn = {'name': 'fn%d' % c, 'arguments': args}
-                calls.append({'type': 'function', 'function': fn}
-                             if rnd.random() < 0.5 else dict(fn))
-            amsg = {'role': 'assistant',
-                    'content': _phrase(rnd) if rnd.random() < 0.4 else '',
-                    'tool_calls': calls}
+                fn = {"name": "fn%d" % c, "arguments": args}
+                calls.append(
+                    {"type": "function", "function": fn}
+                    if rnd.random() < 0.5
+                    else dict(fn)
+                )
+            amsg = {
+                "role": "assistant",
+                "content": _phrase(rnd) if rnd.random() < 0.4 else "",
+                "tool_calls": calls,
+            }
             if rnd.random() < 0.5:
                 rz = _phrase(rnd)
                 r_pick = rnd.random()
                 if r_pick < 0.34:
-                    amsg['content'] = '<think>\n' + rz + '\n</think>\n\n' + amsg['content']
+                    amsg["content"] = (
+                        "<think>\n" + rz + "\n</think>\n\n" + amsg["content"]
+                    )
                 elif r_pick < 0.67:
-                    amsg['reasoning_content'] = rz
+                    amsg["reasoning_content"] = rz
                 else:
-                    amsg['reasoning'] = rz
+                    amsg["reasoning"] = rz
                 if preserve:
                     reasonings.append(rz)
             msgs.append(amsg)
             for _ in calls:
                 if rnd.random() < 0.12:
-                    msgs.append({'role': 'tool', 'content': '{"error": "boom"}'})
+                    msgs.append({"role": "tool", "content": '{"error": "boom"}'})
                     planted_error = True
                 else:
-                    msgs.append({'role': 'tool', 'content': 'result ' + _phrase(rnd)})
+                    msgs.append({"role": "tool", "content": "result " + _phrase(rnd)})
 
         ans = _phrase(rnd)
-        amsg = {'role': 'assistant', 'content': ans}
+        amsg = {"role": "assistant", "content": ans}
         if rnd.random() < 0.6:
             rz = _phrase(rnd)
             r_pick = rnd.random()
             if r_pick < 0.34:
-                amsg['content'] = '<think>\n' + rz + '\n</think>\n\n' + ans
+                amsg["content"] = "<think>\n" + rz + "\n</think>\n\n" + ans
             elif r_pick < 0.67:
-                amsg['reasoning_content'] = rz
+                amsg["reasoning_content"] = rz
             else:
-                amsg['reasoning'] = rz
+                amsg["reasoning"] = rz
             if preserve:
                 reasonings.append(rz)
         msgs.append(amsg)
         answers.append(ans)
 
-    return dict(msgs=msgs, kwargs=kwargs, fmt=fmt, preserve=preserve,
-                no_think=no_think, user_texts=user_texts, answers=answers,
-                reasonings=reasonings, xml_keys=xml_keys, xml_vals=xml_vals,
-                planted_error=planted_error)
+    return dict(
+        msgs=msgs,
+        kwargs=kwargs,
+        fmt=fmt,
+        preserve=preserve,
+        no_think=no_think,
+        user_texts=user_texts,
+        answers=answers,
+        reasonings=reasonings,
+        xml_keys=xml_keys,
+        xml_vals=xml_vals,
+        planted_error=planted_error,
+    )
 
 
 def _check(case, tpl, other, failures, idx):
-    msgs, kw = case['msgs'], case['kwargs']
+    msgs, kw = case["msgs"], case["kwargs"]
 
     def fail(inv, detail):
-        failures.append({
-            'case': idx, 'invariant': inv, 'detail': detail,
-            'repro': json.dumps({'messages': msgs, 'kwargs': kw},
-                                ensure_ascii=False, default=str)})
+        failures.append(
+            {
+                "case": idx,
+                "invariant": inv,
+                "detail": detail,
+                "repro": json.dumps(
+                    {"messages": msgs, "kwargs": kw}, ensure_ascii=False, default=str
+                ),
+            }
+        )
 
     try:
         out = tpl.render(messages=msgs, add_generation_prompt=False, **kw)
     except Exception:
-        fail('render', traceback.format_exc().strip().splitlines()[-1])
+        fail("render", traceback.format_exc().strip().splitlines()[-1])
         return
     try:
         out_b = other.render(messages=msgs, add_generation_prompt=False, **kw)
         if out != out_b:
-            i = next((j for j in range(min(len(out), len(out_b)))
-                      if out[j] != out_b[j]), min(len(out), len(out_b)))
-            fail('parity', 'first diff at char %d: %r vs %r'
-                 % (i, out[i:i + 40], out_b[i:i + 40]))
+            i = next(
+                (j for j in range(min(len(out), len(out_b))) if out[j] != out_b[j]),
+                min(len(out), len(out_b)),
+            )
+            fail(
+                "parity",
+                "first diff at char %d: %r vs %r"
+                % (i, out[i : i + 40], out_b[i : i + 40]),
+            )
     except Exception:
-        fail('parity', traceback.format_exc().strip().splitlines()[-1])
+        fail("parity", traceback.format_exc().strip().splitlines()[-1])
 
-    if out.count('<|im_start|>') != out.count('<|im_end|>'):
-        fail('balance', '%d starts vs %d ends'
-             % (out.count('<|im_start|>'), out.count('<|im_end|>')))
+    if out.count("<|im_start|>") != out.count("<|im_end|>"):
+        fail(
+            "balance",
+            "%d starts vs %d ends"
+            % (out.count("<|im_start|>"), out.count("<|im_end|>")),
+        )
 
-    for text in case['user_texts'] + case['answers'] + case['reasonings']:
+    for text in case["user_texts"] + case["answers"] + case["reasonings"]:
         if text not in out:
-            fail('content', 'missing %r' % text[:60])
+            fail("content", "missing %r" % text[:60])
             break
 
-    if case['fmt'] == 'xml':
-        for key in case['xml_keys']:
-            if ('<parameter=%s>' % key) not in out:
-                fail('xml-fidelity', 'missing key %s' % key)
+    if case["fmt"] == "xml":
+        for key in case["xml_keys"]:
+            if ("<parameter=%s>" % key) not in out:
+                fail("xml-fidelity", "missing key %s" % key)
                 break
-        for value in case['xml_vals']:
+        for value in case["xml_vals"]:
             if value not in out:
-                fail('xml-fidelity', 'missing value %r' % value[:60])
+                fail("xml-fidelity", "missing value %r" % value[:60])
                 break
 
-    if case['fmt'] == 'json':
-        for block in out.split('<tool_call>\n')[1:]:
-            body = block.split('\n</tool_call>')[0]
+    if case["fmt"] == "json":
+        for block in out.split("<tool_call>\n")[1:]:
+            body = block.split("\n</tool_call>")[0]
             try:
                 json.loads(body)
             except Exception:
-                fail('json-validity', body[:80])
+                fail("json-validity", body[:80])
                 break
 
-    warned = '⚠️ SYSTEM WARNING' in out
-    if warned != case['planted_error']:
-        fail('warning', 'warned=%s planted=%s' % (warned, case['planted_error']))
+    warned = "⚠️ SYSTEM WARNING" in out
+    if warned != case["planted_error"]:
+        fail("warning", "warned=%s planted=%s" % (warned, case["planted_error"]))
 
-    if case['preserve']:
+    if case["preserve"]:
         prev = None
         for k in range(1, len(msgs) + 1):
-            if k < len(msgs) and msgs[k]['role'] == msgs[k - 1]['role'] \
-                    and msgs[k]['role'] in ('system', 'tool'):
+            if (
+                k < len(msgs)
+                and msgs[k]["role"] == msgs[k - 1]["role"]
+                and msgs[k]["role"] in ("system", "tool")
+            ):
                 continue
             cur = tpl.render(messages=msgs[:k], add_generation_prompt=False, **kw)
-            
-            if k > 1 and msgs[k - 1].get('role') == 'assistant':
-                prompt = tpl.render(messages=msgs[:k - 1], add_generation_prompt=True, **kw)
+
+            if k > 1 and msgs[k - 1].get("role") == "assistant":
+                prompt = tpl.render(
+                    messages=msgs[: k - 1], add_generation_prompt=True, **kw
+                )
                 if not cur.startswith(prompt):
-                    if prompt.endswith('<think>\n\n</think>\n\n') and cur.startswith(prompt[:-11]):
+                    if prompt.endswith("<think>\n\n</think>\n\n") and cur.startswith(
+                        prompt[:-11]
+                    ):
                         # Fuzzer randomly injected reasoning into a non-thinking turn. KV cache naturally breaks here.
                         pass
                     else:
-                        fail('prefix', 'generation prompt at turn %d not prefix of history at turn %d' % (k - 1, k))
+                        fail(
+                            "prefix",
+                            "generation prompt at turn %d not prefix of history at turn %d"
+                            % (k - 1, k),
+                        )
                         break
-                    
+
             if prev is not None and not cur.startswith(prev):
-                fail('prefix', 'history mutated at turn %d' % k)
+                fail("prefix", "history mutated at turn %d" % k)
                 break
             prev = cur
 
-    if case['no_think']:
+    if case["no_think"]:
         gen = tpl.render(messages=msgs, add_generation_prompt=True, **kw)
-        if not gen.endswith('<think>\n\n</think>\n\n'):
-            fail('prefill', repr(gen[-40:]))
+        if not gen.endswith("<think>\n\n</think>\n\n"):
+            fail("prefill", repr(gen[-40:]))
 
 
-def run_fuzz(cases=500, seed=0, template_dir=None,
-             template_file='chat_template.jinja', max_failures=10):
+def run_fuzz(
+    cases=500,
+    seed=0,
+    template_dir=None,
+    template_file="chat_template.jinja",
+    max_failures=10,
+):
     template_dir = template_dir or os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__)))
-    env = Environment(loader=FileSystemLoader(template_dir),
-                      undefined=StrictUndefined, keep_trailing_newline=True,
-                      lstrip_blocks=True, trim_blocks=True)
-    env.globals['raise_exception'] = \
-        lambda m: (_ for _ in ()).throw(Exception(m))
+        os.path.dirname(os.path.abspath(__file__))
+    )
+    env = Environment(
+        loader=FileSystemLoader(template_dir),
+        undefined=StrictUndefined,
+        keep_trailing_newline=True,
+        lstrip_blocks=True,
+        trim_blocks=True,
+    )
+    env.globals["raise_exception"] = lambda m: (_ for _ in ()).throw(Exception(m))
     tpl = env.get_template(template_file)
-    other_name = ('chat_template.jinja'
-                  if template_file == 'chat_template_oneline.txt'
-                  else 'chat_template_oneline.txt')
+    other_name = (
+        "chat_template.jinja"
+        if template_file == "chat_template_oneline.txt"
+        else "chat_template_oneline.txt"
+    )
     other = env.get_template(other_name)
     rnd = random.Random(seed)
     failures = []
@@ -269,22 +336,25 @@ def run_fuzz(cases=500, seed=0, template_dir=None,
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument('--cases', type=int, default=500)
-    parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--template', default='chat_template.jinja')
+    parser.add_argument("--cases", type=int, default=500)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--template", default="chat_template.jinja")
     args = parser.parse_args()
-    failures = run_fuzz(cases=args.cases, seed=args.seed,
-                        template_file=args.template)
+    failures = run_fuzz(cases=args.cases, seed=args.seed, template_file=args.template)
     if failures:
         for f in failures:
-            print('FAIL case %d [%s]: %s' % (f['case'], f['invariant'], f['detail']))
-            print('  repro: %s' % f['repro'][:800])
-        print('\n%d invariant violation(s) in %d cases (seed %d)'
-              % (len(failures), args.cases, args.seed))
+            print("FAIL case %d [%s]: %s" % (f["case"], f["invariant"], f["detail"]))
+            print("  repro: %s" % f["repro"][:800])
+        print(
+            "\n%d invariant violation(s) in %d cases (seed %d)"
+            % (len(failures), args.cases, args.seed)
+        )
         sys.exit(1)
-    print('All invariants held over %d generated conversations (seed %d).'
-          % (args.cases, args.seed))
+    print(
+        "All invariants held over %d generated conversations (seed %d)."
+        % (args.cases, args.seed)
+    )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

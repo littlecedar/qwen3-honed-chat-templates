@@ -37,6 +37,7 @@ def extract_template_version(content: str) -> str:
 def inspect_gguf(path: str):
     try:
         import gguf
+
         reader = gguf.GGUFReader(path)
         for field in reader.fields.values():
             if field.name == "tokenizer.chat_template":
@@ -99,7 +100,9 @@ def main():
 
     if not sources:
         print(f"{RED}❌ No template files found in {target}{RESET}")
-        print("Expected `chat_template.jinja`, `tokenizer_config.json`, or a `.gguf` file.\n")
+        print(
+            "Expected `chat_template.jinja`, `tokenizer_config.json`, or a `.gguf` file.\n"
+        )
         sys.exit(1)
 
     versions = {}
@@ -120,15 +123,21 @@ def main():
         print("Your runtime may pick a different template depending on precedence:")
         print("  - Transformers ≥ 4.51 / LM Studio: prefers `chat_template.jinja`")
         print("  - oMLX / legacy engines: reads `tokenizer_config.json`")
-        print(f"\n{BOLD}Recommendation:{RESET} Overwrite both sources with `chat_template.jinja` and `chat_template_oneline.txt`.\n")
+        print(
+            f"\n{BOLD}Recommendation:{RESET} Overwrite both sources with `chat_template.jinja` and `chat_template_oneline.txt`.\n"
+        )
         sys.exit(1)
     else:
         active_ver = list(unique_versions)[0]
         if "froggeric-v22.5" in active_ver:
-            print(f"{GREEN}✅ SUCCESS: Verified v22.5 template is cleanly installed!{RESET}\n")
+            print(
+                f"{GREEN}✅ SUCCESS: Verified v22.5 template is cleanly installed!{RESET}\n"
+            )
             sys.exit(0)
         elif "froggeric" in active_ver:
-            print(f"{CYAN}ℹ️  INFO: Found earlier fixed template version ({active_ver}). Upgrade to v22.5 recommended.{RESET}\n")
+            print(
+                f"{CYAN}ℹ️  INFO: Found earlier fixed template version ({active_ver}). Upgrade to v22.5 recommended.{RESET}\n"
+            )
             sys.exit(0)
         else:
             print(f"{YELLOW}⚠️  Stock / unpatched template detected.{RESET}\n")
