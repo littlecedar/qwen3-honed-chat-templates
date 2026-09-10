@@ -144,16 +144,36 @@
 {%- set sys_state = namespace(content='') %}
 {%- for message in messages[:head.count] %}
     {%- set _part = render_content(message.content, false, true) | trim %}
-    {%- if '<|think_off|>' in _part %}{%- set _part = _part.split('<|think_off|>') | join('') | trim %}{%- endif %}
-    {%- if '<|think_on|>' in _part %}{%- set _part = _part.split('<|think_on|>') | join('') | trim %}{%- endif %}
-    {%- if '<|think_xhigh|>' in _part %}{%- set _part = _part.split('<|think_xhigh|>') | join('') | trim %}{%- endif %}
-    {%- if '<|think_high|>' in _part %}{%- set _part = _part.split('<|think_high|>') | join('') | trim %}{%- endif %}
-    {%- if '<|think_ultracode|>' in _part %}{%- set _part = _part.split('<|think_ultracode|>') | join('') | trim %}{%- endif %}
-    {%- if '<|think_extreme|>' in _part %}{%- set _part = _part.split('<|think_extreme|>') | join('') | trim %}{%- endif %}
-    {%- if '<|think_max|>' in _part %}{%- set _part = _part.split('<|think_max|>') | join('') | trim %}{%- endif %}
-    {%- if '<|think_medium|>' in _part %}{%- set _part = _part.split('<|think_medium|>') | join('') | trim %}{%- endif %}
-    {%- if '<|think_low|>' in _part %}{%- set _part = _part.split('<|think_low|>') | join('') | trim %}{%- endif %}
-    {%- if '<|think_minimal|>' in _part %}{%- set _part = _part.split('<|think_minimal|>') | join('') | trim %}{%- endif %}
+    {%- if '<|think_off|>' in _part %}
+        {%- set _part = _part.split('<|think_off|>') | join('') | trim %}
+    {%- endif %}
+    {%- if '<|think_on|>' in _part %}
+        {%- set _part = _part.split('<|think_on|>') | join('') | trim %}
+    {%- endif %}
+    {%- if '<|think_xhigh|>' in _part %}
+        {%- set _part = _part.split('<|think_xhigh|>') | join('') | trim %}
+    {%- endif %}
+    {%- if '<|think_high|>' in _part %}
+        {%- set _part = _part.split('<|think_high|>') | join('') | trim %}
+    {%- endif %}
+    {%- if '<|think_ultracode|>' in _part %}
+        {%- set _part = _part.split('<|think_ultracode|>') | join('') | trim %}
+    {%- endif %}
+    {%- if '<|think_extreme|>' in _part %}
+        {%- set _part = _part.split('<|think_extreme|>') | join('') | trim %}
+    {%- endif %}
+    {%- if '<|think_max|>' in _part %}
+        {%- set _part = _part.split('<|think_max|>') | join('') | trim %}
+    {%- endif %}
+    {%- if '<|think_medium|>' in _part %}
+        {%- set _part = _part.split('<|think_medium|>') | join('') | trim %}
+    {%- endif %}
+    {%- if '<|think_low|>' in _part %}
+        {%- set _part = _part.split('<|think_low|>') | join('') | trim %}
+    {%- endif %}
+    {%- if '<|think_minimal|>' in _part %}
+        {%- set _part = _part.split('<|think_minimal|>') | join('') | trim %}
+    {%- endif %}
     {%- if _part %}
         {%- if sys_state.content %}
             {%- set sys_state.content = sys_state.content ~ '\n\n' ~ _part %}
@@ -267,16 +287,36 @@ If a user request is genuinely ambiguous, ask a sharp question, don't guess.
     {%- set is_system = (message.role == "system" or message.role == "developer") %}
     {%- set content = render_content(message.content, true, is_system) | trim %}
     {%- if is_system or message.role == 'user' %}
-        {%- if '<|think_off|>' in content %}{%- set content = content.split('<|think_off|>') | join('') | trim %}{%- endif %}
-        {%- if '<|think_on|>' in content %}{%- set content = content.split('<|think_on|>') | join('') | trim %}{%- endif %}
-        {%- if '<|think_xhigh|>' in content %}{%- set content = content.split('<|think_xhigh|>') | join('') | trim %}{%- endif %}
-        {%- if '<|think_high|>' in content %}{%- set content = content.split('<|think_high|>') | join('') | trim %}{%- endif %}
-        {%- if '<|think_ultracode|>' in content %}{%- set content = content.split('<|think_ultracode|>') | join('') | trim %}{%- endif %}
-        {%- if '<|think_extreme|>' in content %}{%- set content = content.split('<|think_extreme|>') | join('') | trim %}{%- endif %}
-        {%- if '<|think_max|>' in content %}{%- set content = content.split('<|think_max|>') | join('') | trim %}{%- endif %}
-        {%- if '<|think_medium|>' in content %}{%- set content = content.split('<|think_medium|>') | join('') | trim %}{%- endif %}
-        {%- if '<|think_low|>' in content %}{%- set content = content.split('<|think_low|>') | join('') | trim %}{%- endif %}
-        {%- if '<|think_minimal|>' in content %}{%- set content = content.split('<|think_minimal|>') | join('') | trim %}{%- endif %}
+        {%- if '<|think_off|>' in content %}
+            {%- set content = content.split('<|think_off|>') | join('') | trim %}
+        {%- endif %}
+        {%- if '<|think_on|>' in content %}
+            {%- set content = content.split('<|think_on|>') | join('') | trim %}
+        {%- endif %}
+        {%- if '<|think_xhigh|>' in content %}
+            {%- set content = content.split('<|think_xhigh|>') | join('') | trim %}
+        {%- endif %}
+        {%- if '<|think_high|>' in content %}
+            {%- set content = content.split('<|think_high|>') | join('') | trim %}
+        {%- endif %}
+        {%- if '<|think_ultracode|>' in content %}
+            {%- set content = content.split('<|think_ultracode|>') | join('') | trim %}
+        {%- endif %}
+        {%- if '<|think_extreme|>' in content %}
+            {%- set content = content.split('<|think_extreme|>') | join('') | trim %}
+        {%- endif %}
+        {%- if '<|think_max|>' in content %}
+            {%- set content = content.split('<|think_max|>') | join('') | trim %}
+        {%- endif %}
+        {%- if '<|think_medium|>' in content %}
+            {%- set content = content.split('<|think_medium|>') | join('') | trim %}
+        {%- endif %}
+        {%- if '<|think_low|>' in content %}
+            {%- set content = content.split('<|think_low|>') | join('') | trim %}
+        {%- endif %}
+        {%- if '<|think_minimal|>' in content %}
+            {%- set content = content.split('<|think_minimal|>') | join('') | trim %}
+        {%- endif %}
     {%- endif %}
     {%- if is_system %}
         {{- '<|im_start|>system\n' + content + '<|im_end|>\n' }}
