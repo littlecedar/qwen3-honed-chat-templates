@@ -153,6 +153,11 @@ class TestApplyChatTemplate(unittest.TestCase):
             res.stdout,
             msg="CLI --help output does not describe the '--force' flag.",
         )
+        self.assertIn(
+            "--uninstall",
+            res.stdout,
+            msg="CLI --help output does not describe the '--uninstall' flag.",
+        )
 
     def test_missing_model_path_argument(self):
         """PASS: CLI exits with error code when no model path argument is passed; FAIL: Accepts invocation without arguments."""
@@ -434,36 +439,250 @@ class TestApplyChatTemplate(unittest.TestCase):
         self.assertTrue(np.array_equal(tensor.data, orig_arr), msg="Tensor data corrupted on extensionless GGUF file.")
         del reader
 
-    def test_gguf_temp_file_cleanup_on_write_error(self):
-        """PASS: Cleans up temporary .tmp files when write error occurs during GGUF metadata update; FAIL: Leaves temporary files behind or ignores error."""
+    def test_gguf_metadata_update_error_exits(self):
+        """PASS: Exits with an error when in-place GGUF metadata update fails; FAIL: Hides the update error or continues as if patching succeeded."""
         gguf_path, _ = self.create_synthetic_gguf("fail_write.gguf", template="init")
 
-        def failing_copy(*args, **kwargs):
-            raise RuntimeError("Simulated failure during metadata copy")
+        def failing_set_metadata(*args, **kwargs):
+            raise RuntimeError("Simulated failure during in-place metadata update")
 
-        orig_copy = install.copy_with_new_metadata
-        self.addCleanup(setattr, install, "copy_with_new_metadata", orig_copy)
-        install.copy_with_new_metadata = failing_copy
+        original_set_metadata = install.gguf_set_metadata
+        self.addCleanup(setattr, install, "gguf_set_metadata", original_set_metadata)
+        install.gguf_set_metadata = failing_set_metadata
 
         with assert_expected_failure(
-            "GGUF patch write failure exits and cleans up temporary files",
-            expected_stderr_pattern="Simulated failure during metadata copy",
+            "GGUF metadata update failure exits cleanly",
+            expected_stderr_pattern="Simulated failure during in-place metadata update",
         ):
             with self.assertRaises(SystemExit) as ctx:
                 install.patch_gguf(gguf_path, "new template", force=True)
             self.assertEqual(
                 ctx.exception.code,
                 1,
-                msg=f"Expected exit code 1 on write error, got {ctx.exception.code}",
+                msg=f"Expected exit code 1 on metadata update error, got {ctx.exception.code}",
             )
 
-        # Ensure no temporary .tmp files remain
-        tmp_files = list(self.test_dir.glob("*.tmp"))
+        reader = gguf.GGUFReader(gguf_path, "r")
         self.assertEqual(
-            tmp_files,
-            [],
-            msg=f"Temporary files were not cleaned up after error: {tmp_files}",
+            reader.get_field("tokenizer.chat_template").contents(),
+            "init",
+            msg="GGUF template changed despite metadata update failure.",
         )
+        del reader
+
+    def test_gguf_set_metadata_inplace(self):
+        """PASS: gguf_set_metadata modifies metadata in-place preserving tensor weights, alignment, and offsets; FAIL: Corrupts tensors or fails to update metadata."""
+        gguf_path, orig_arr = self.create_synthetic_gguf(
+            "inplace_test.gguf", template="short template", alignment=64
+        )
+
+        # 1. Header growth test (expanding metadata)
+        large_template = "expanded template string " * 50
+        res = install.gguf_set_metadata(gguf_path, "tokenizer.chat_template", large_template)
+        self.assertTrue(res, msg="gguf_set_metadata returned False on expansion.")
+
+        reader = gguf.GGUFReader(gguf_path, "r")
+        self.assertEqual(
+            reader.get_field("tokenizer.chat_template").contents(),
+            large_template,
+            msg="Expanded chat template was not properly saved.",
+        )
+        self.assertEqual(reader.alignment, 64)
+        tensor = reader.get_tensor(0)
+        self.assertTrue(np.array_equal(tensor.data, orig_arr), msg="Tensor weights corrupted during expansion.")
+        del reader
+
+        # 2. Header shrinkage test (contracting metadata)
+        short_template = "tiny"
+        res = install.gguf_set_metadata(gguf_path, "tokenizer.chat_template", short_template)
+        self.assertTrue(res, msg="gguf_set_metadata returned False on shrinkage.")
+
+        reader = gguf.GGUFReader(gguf_path, "r")
+        self.assertEqual(
+            reader.get_field("tokenizer.chat_template").contents(),
+            short_template,
+            msg="Shrunk chat template was not properly saved.",
+        )
+        self.assertEqual(reader.alignment, 64)
+        tensor = reader.get_tensor(0)
+        self.assertTrue(np.array_equal(tensor.data, orig_arr), msg="Tensor weights corrupted during shrinkage.")
+        del reader
+
+        # 3. Add new key and remove key test
+        res = install.gguf_set_metadata(
+            gguf_path,
+            {"custom.test_key": "custom_val"},
+            removals=["tokenizer.chat_template"],
+        )
+        self.assertTrue(res, msg="gguf_set_metadata returned False on add/removal.")
+
+        reader = gguf.GGUFReader(gguf_path, "r")
+        self.assertIsNone(reader.get_field("tokenizer.chat_template"), msg="Removed key was still found.")
+        self.assertEqual(
+            reader.get_field("custom.test_key").contents(),
+            "custom_val",
+            msg="Newly added key was not found or has incorrect value.",
+        )
+        tensor = reader.get_tensor(0)
+        self.assertTrue(np.array_equal(tensor.data, orig_arr), msg="Tensor weights corrupted during add/removal.")
+        del reader
+
+    def test_gguf_patch_creates_backup_key(self):
+        """PASS: patch_gguf backs up the original template to tokenizer.chat_template.backup; FAIL: Backup key missing or template not updated."""
+        gguf_path, orig_arr = self.create_synthetic_gguf(
+            "backup_test.gguf", template="original pre-patch template", alignment=32
+        )
+
+        res = install.patch_gguf(gguf_path, "new honed template", force=True)
+        self.assertTrue(res, msg="patch_gguf failed with force=True.")
+
+        reader = gguf.GGUFReader(gguf_path, "r")
+        self.assertEqual(
+            reader.get_field("tokenizer.chat_template").contents(),
+            "new honed template",
+            msg="tokenizer.chat_template was not updated to the new template.",
+        )
+        backup_field = reader.get_field("tokenizer.chat_template.backup")
+        self.assertIsNotNone(backup_field, msg="tokenizer.chat_template.backup field was not created.")
+        self.assertEqual(
+            backup_field.contents(),
+            "original pre-patch template",
+            msg="tokenizer.chat_template.backup does not contain original pre-patch template.",
+        )
+        tensor = reader.get_tensor(0)
+        self.assertTrue(np.array_equal(tensor.data, orig_arr), msg="Tensor weights corrupted after patch_gguf.")
+        del reader
+
+    def test_extract_and_restore_gguf_backup(self):
+        """PASS: extract_gguf_backup and restore_gguf_backup correctly restore template and remove backup key; FAIL: Restore fails or backup key retained."""
+        gguf_path, orig_arr = self.create_synthetic_gguf(
+            "restore_test.gguf", template="pristine stock template"
+        )
+
+        # Before patch, no backup exists
+        self.assertIsNone(install.extract_gguf_backup(gguf_path))
+        # Restore on unbacked model returns False
+        self.assertFalse(install.restore_gguf_backup(gguf_path))
+
+        # Patch model
+        install.patch_gguf(gguf_path, "modified template", force=True)
+        self.assertEqual(install.extract_gguf_backup(gguf_path), "pristine stock template")
+        self.assertEqual(install.extract_gguf_chat_template(gguf_path), "modified template")
+
+        # Restore backup
+        restore_res = install.restore_gguf_backup(gguf_path)
+        self.assertTrue(restore_res, msg="restore_gguf_backup returned False.")
+
+        # Verify chat_template is restored and backup key is removed
+        self.assertEqual(install.extract_gguf_chat_template(gguf_path), "pristine stock template")
+        self.assertIsNone(install.extract_gguf_backup(gguf_path))
+
+        reader = gguf.GGUFReader(gguf_path, "r")
+        self.assertIsNone(reader.get_field("tokenizer.chat_template.backup"))
+        tensor = reader.get_tensor(0)
+        self.assertTrue(np.array_equal(tensor.data, orig_arr), msg="Tensor weights corrupted after restore.")
+        del reader
+
+    def test_directory_uninstall_with_existing_template(self):
+        """PASS: --uninstall restores tokenizer_config.json and chat_template.jinja from backups and removes .bak files; FAIL: Fails to restore original files or retain backups."""
+        model_dir = self.test_dir / "uninst_with_jinja"
+        model_dir.mkdir()
+        orig_jinja = "original stock jinja"
+        orig_config = {"bos_token": "<|im_start|>", "chat_template": "original stock template"}
+        (model_dir / "chat_template.jinja").write_text(orig_jinja)
+        (model_dir / "tokenizer_config.json").write_text(json.dumps(orig_config, indent=2) + "\n")
+
+        # Install
+        patch_res = self.run_script(str(model_dir))
+        self.assertEqual(patch_res.returncode, 0)
+        self.assertTrue((model_dir / "tokenizer_config.json.bak").is_file())
+        self.assertTrue((model_dir / "chat_template.jinja.bak").is_file())
+
+        # Uninstall
+        uninst_res = self.run_script(str(model_dir), "--uninstall")
+        self.assertEqual(uninst_res.returncode, 0, msg=f"Uninstall failed: {uninst_res.stderr}")
+        self.assertIn("Successfully uninstalled chat template from directory.", uninst_res.stdout)
+        self.assertFalse((model_dir / "tokenizer_config.json.bak").exists())
+        self.assertFalse((model_dir / "chat_template.jinja.bak").exists())
+        self.assertEqual((model_dir / "chat_template.jinja").read_text(), orig_jinja)
+        self.assertEqual(json.loads((model_dir / "tokenizer_config.json").read_text()), orig_config)
+
+    def test_directory_uninstall_without_prior_jinja(self):
+        """PASS: --uninstall restores tokenizer_config.json and deletes newly created chat_template.jinja; FAIL: Leaves newly created jinja file or fails to restore config."""
+        model_dir = self.test_dir / "uninst_no_prior_jinja"
+        model_dir.mkdir()
+        orig_config = {"model_max_length": 8192, "chat_template": "stock config template"}
+        (model_dir / "tokenizer_config.json").write_text(json.dumps(orig_config, indent=2) + "\n")
+
+        # Install
+        patch_res = self.run_script(str(model_dir))
+        self.assertEqual(patch_res.returncode, 0)
+        self.assertTrue((model_dir / "tokenizer_config.json.bak").is_file())
+        self.assertTrue((model_dir / "chat_template.jinja").is_file())
+        self.assertFalse((model_dir / "chat_template.jinja.bak").exists())
+
+        # Uninstall
+        uninst_res = self.run_script(str(model_dir), "--uninstall")
+        self.assertEqual(uninst_res.returncode, 0, msg=f"Uninstall failed: {uninst_res.stderr}")
+        self.assertIn("Successfully uninstalled chat template from directory.", uninst_res.stdout)
+        self.assertFalse((model_dir / "tokenizer_config.json.bak").exists())
+        self.assertFalse((model_dir / "chat_template.jinja").exists(), msg="Newly created chat_template.jinja was not deleted upon uninstall.")
+        self.assertEqual(json.loads((model_dir / "tokenizer_config.json").read_text()), orig_config)
+
+    def test_directory_uninstall_no_backups_fails(self):
+        """PASS: CLI rejects uninstall on directory with no backups; FAIL: Exits with 0 or alters directory."""
+        model_dir = self.test_dir / "uninst_no_backups"
+        model_dir.mkdir()
+        (model_dir / "tokenizer_config.json").write_text(json.dumps({"chat_template": "curr"}))
+
+        res = self.run_script(str(model_dir), "--uninstall")
+        self.assert_subprocess_failure(
+            res,
+            description="Directory uninstall without backup files",
+            expected_stderr="No backup files found",
+            expected_exit_code=1,
+        )
+
+    def test_gguf_uninstall_success(self):
+        """PASS: --uninstall restores GGUF chat template from backup metadata and removes backup key; FAIL: Fails to restore template, corrupts tensors, or retains backup key."""
+        gguf_path, orig_arr = self.create_synthetic_gguf(
+            "uninst_test.gguf", template="stock pre-patch gguf template", alignment=32
+        )
+
+        # Patch GGUF
+        patch_res = self.run_script(str(gguf_path), "--force")
+        self.assertEqual(patch_res.returncode, 0)
+        self.assertEqual(install.extract_gguf_backup(gguf_path), "stock pre-patch gguf template")
+
+        # Uninstall GGUF
+        uninst_res = self.run_script(str(gguf_path), "--uninstall")
+        self.assertEqual(uninst_res.returncode, 0, msg=f"Uninstall GGUF failed: {uninst_res.stderr}")
+        self.assertIn("Successfully uninstalled chat template from GGUF.", uninst_res.stdout)
+
+        # Verify chat_template is restored and backup key is removed
+        self.assertEqual(install.extract_gguf_chat_template(gguf_path), "stock pre-patch gguf template")
+        self.assertIsNone(install.extract_gguf_backup(gguf_path))
+
+        reader = gguf.GGUFReader(gguf_path, "r")
+        self.assertIsNone(reader.get_field("tokenizer.chat_template.backup"))
+        tensor = reader.get_tensor(0)
+        self.assertTrue(np.array_equal(tensor.data, orig_arr), msg="Tensor weights corrupted after GGUF uninstall.")
+        del reader
+
+    def test_gguf_uninstall_no_backup_fails(self):
+        """PASS: CLI rejects GGUF uninstall when no backup metadata key exists; FAIL: Exits with 0 or alters file."""
+        gguf_path, orig_arr = self.create_synthetic_gguf(
+            "uninst_no_bak.gguf", template="stock template", alignment=32
+        )
+
+        res = self.run_script(str(gguf_path), "--uninstall")
+        self.assert_subprocess_failure(
+            res,
+            description="GGUF uninstall without backup key",
+            expected_stderr="No backup chat template found",
+            expected_exit_code=1,
+        )
+        self.assertEqual(install.extract_gguf_chat_template(gguf_path), "stock template")
 
     def test_verify_directory_success(self):
         """PASS: verify_directory returns True when directory template files match repository template; FAIL: Returns False for matching templates."""

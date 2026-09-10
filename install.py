@@ -12,8 +12,12 @@ This script updates model chat templates with the one from this repository.
 - GGUF mode (llama.cpp format):
   - Validates GGUF file format and header magic.
   - Prompts for confirmation unless --force is given.
-  - Safely rewrites tokenizer.chat_template metadata using minified template.
-  - Preserves architecture, tensors, alignment, and endianness via atomic replacement.
+  - Safely updates tokenizer.chat_template metadata in place using the minified template.
+  - Preserves architecture, tensors, alignment, and endianness without copying tensor data.
+
+- Uninstallation mode (--uninstall):
+  - For directories: restores tokenizer_config.json and chat_template.jinja from .bak files (or removes chat_template.jinja if created during installation) and cleans up backup files.
+  - For GGUF files: restores the original chat template from tokenizer.chat_template.backup metadata key in place and removes the backup key.
 """
 
 from __future__ import annotations
@@ -21,21 +25,16 @@ from __future__ import annotations
 import argparse
 import gc
 import json
-import os
-from pathlib import Path
 import re
 import shutil
+import struct
 import sys
-import tempfile
+from pathlib import Path
+from typing import Any, Sequence
 
-from jinja2 import Environment
 import gguf
-from gguf import GGUFValueType, Keys, GGUFWriter
-from gguf.scripts.gguf_new_metadata import (
-    MetadataDetails,
-    copy_with_new_metadata,
-    get_field_data,
-)
+from gguf import GGUFValueType, Keys
+from jinja2 import Environment
 
 from scripts.minify_jinja import minify_jinja
 
@@ -64,7 +63,7 @@ SYSTEM_PROBE = "Be a pirate."
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Apply the chat template to a model directory or GGUF file."
+        description="Apply or uninstall the chat template for a model directory or GGUF file."
     )
     parser.add_argument(
         "model_path",
@@ -76,6 +75,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-f",
         action="store_true",
         help="Bypass confirmation prompt when patching GGUF files",
+    )
+    parser.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="Revert model directory or GGUF file back to its pre-installation state using backup data",
     )
     return parser.parse_args(argv)
 
@@ -156,16 +160,297 @@ def patch_directory(target_dir: Path, source_template_path: Path) -> None:
     print(f"Updated 'chat_template' in '{tokenizer_config_path}'")
 
 
+def uninstall_directory(target_dir: Path | str) -> bool:
+    """Uninstall the chat template from the model directory and restore from backups."""
+    target_dir = Path(target_dir)
+    if not target_dir.is_dir():
+        print(
+            f"Error: Target path '{target_dir}' is not a directory.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    tokenizer_config_path = target_dir / "tokenizer_config.json"
+    bak_config = target_dir / "tokenizer_config.json.bak"
+    target_template_path = target_dir / SOURCE_TEMPLATE_NAME
+    bak_template = target_dir / f"{SOURCE_TEMPLATE_NAME}.bak"
+
+    if not bak_config.is_file() and not bak_template.is_file():
+        print(
+            f"Error: No backup files found in model directory '{target_dir}'.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not bak_config.is_file():
+        print(
+            f"Error: Missing backup file '{bak_config.name}' in model directory '{target_dir}'.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # 1. Restore tokenizer_config.json from tokenizer_config.json.bak
+    try:
+        shutil.copy2(bak_config, tokenizer_config_path)
+        bak_config.unlink()
+        print(f"Restored '{tokenizer_config_path.name}' from backup and removed '{bak_config.name}'.")
+    except Exception as e:
+        print(
+            f"Error: Failed to restore '{tokenizer_config_path}' from backup: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # 2. Restore chat_template.jinja from chat_template.jinja.bak if present,
+    # or remove chat_template.jinja if it was created during installation and no backup existed.
+    if bak_template.is_file():
+        try:
+            shutil.copy2(bak_template, target_template_path)
+            bak_template.unlink()
+            print(f"Restored '{target_template_path.name}' from backup and removed '{bak_template.name}'.")
+        except Exception as e:
+            print(
+                f"Error: Failed to restore '{target_template_path}' from backup: {e}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    elif target_template_path.is_file():
+        try:
+            target_template_path.unlink()
+            print(f"Removed '{target_template_path.name}' (created during installation).")
+        except Exception as e:
+            print(
+                f"Error: Failed to remove '{target_template_path}': {e}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    return True
+
+
+def pack_kv_data(
+    key: str,
+    val: Any,
+    endianess: gguf.GGUFEndian = gguf.GGUFEndian.LITTLE,
+) -> bytes:
+    """Pack a single metadata key-value pair into GGUF binary format."""
+    prefix = "<" if endianess == gguf.GGUFEndian.LITTLE else ">"
+    key_bytes = key.encode("utf-8")
+    res = bytearray()
+    res += struct.pack(f"{prefix}Q", len(key_bytes))
+    res += key_bytes
+    if isinstance(val, str):
+        val_bytes = val.encode("utf-8")
+        res += struct.pack(f"{prefix}I", int(GGUFValueType.STRING))
+        res += struct.pack(f"{prefix}Q", len(val_bytes))
+        res += val_bytes
+    elif isinstance(val, (bytes, bytearray, memoryview)):
+        val_bytes = bytes(val)
+        res += struct.pack(f"{prefix}I", int(GGUFValueType.STRING))
+        res += struct.pack(f"{prefix}Q", len(val_bytes))
+        res += val_bytes
+    elif isinstance(val, bool):
+        res += struct.pack(f"{prefix}I", int(GGUFValueType.BOOL))
+        res += struct.pack("?", val)
+    elif isinstance(val, int):
+        res += struct.pack(f"{prefix}I", int(GGUFValueType.INT32))
+        res += struct.pack(f"{prefix}i", val)
+    elif isinstance(val, float):
+        res += struct.pack(f"{prefix}I", int(GGUFValueType.FLOAT32))
+        res += struct.pack(f"{prefix}f", val)
+    else:
+        raise ValueError(f"Unsupported metadata value type for key '{key}': {type(val)}")
+    return bytes(res)
+
+
+def gguf_set_metadata(
+    path: Path | str,
+    key_or_updates: str | dict[str, Any] | None = None,
+    value: Any = None,
+    *,
+    removals: Sequence[str] | None = None,
+) -> bool:
+    """In-place GGUF metadata editor.
+
+    Safely updates, adds, or removes metadata keys directly in the target GGUF file
+    without re-quantizing or copying tensor weights. Preserves tensor data offsets,
+    alignment, endianness, and tensor bytes.
+    """
+    target_path = Path(path)
+    if not target_path.is_file():
+        raise FileNotFoundError(f"GGUF file '{target_path}' not found.")
+
+    if isinstance(key_or_updates, str):
+        updates: dict[str, Any] = {key_or_updates: value}
+    elif isinstance(key_or_updates, dict):
+        updates = dict(key_or_updates)
+    elif key_or_updates is None:
+        updates = {}
+    else:
+        raise TypeError(f"Invalid type for key_or_updates: {type(key_or_updates)}")
+
+    keys_to_remove = set(removals) if removals else set()
+    for k, v in list(updates.items()):
+        if v is None:
+            keys_to_remove.add(k)
+            del updates[k]
+
+    reader = None
+    try:
+        reader = gguf.GGUFReader(target_path, "r")
+        version = int(reader.fields["GGUF.version"].parts[0][0])
+        endianess = reader.endianess
+        alignment = int(getattr(reader, "alignment", gguf.GGUF_DEFAULT_ALIGNMENT))
+        tensor_count = len(reader.tensors)
+        old_data_offset = int(reader.data_offset)
+
+        if tensor_count > 0:
+            ti_start = int(reader.tensors[0].field.offset)
+            ti_end = int(
+                reader.tensors[-1].field.offset
+                + sum(p.nbytes for p in reader.tensors[-1].field.parts)
+            )
+            ti_bytes = bytes(reader.data[ti_start:ti_end])
+        else:
+            ti_bytes = b""
+
+        existing_fields: list[tuple[str, bytes]] = []
+        for k, field in reader.fields.items():
+            if k.startswith("GGUF."):
+                continue
+            existing_fields.append((k, b"".join(bytes(p) for p in field.parts)))
+    finally:
+        if reader is not None:
+            del reader
+            gc.collect()
+
+    prefix = "<" if endianess == gguf.GGUFEndian.LITTLE else ">"
+    kv_bytes = bytearray()
+    kv_count = 0
+    handled = set()
+
+    for k, raw_bytes in existing_fields:
+        if k in keys_to_remove:
+            continue
+        if k in updates:
+            handled.add(k)
+            kv_bytes += pack_kv_data(k, updates[k], endianess)
+            kv_count += 1
+        else:
+            kv_bytes += raw_bytes
+            kv_count += 1
+
+    for k, val in updates.items():
+        if k not in handled and k not in keys_to_remove:
+            kv_bytes += pack_kv_data(k, val, endianess)
+            kv_count += 1
+
+    header_bytes = (
+        struct.pack("<I", gguf.GGUF_MAGIC)
+        + struct.pack(f"{prefix}I", version)
+        + struct.pack(f"{prefix}Q", tensor_count)
+        + struct.pack(f"{prefix}Q", kv_count)
+    )
+
+    new_pre_data = bytearray(header_bytes + kv_bytes + ti_bytes)
+    pad = (alignment - (len(new_pre_data) % alignment)) % alignment
+    new_pre_data += bytes(pad)
+    new_data_offset = len(new_pre_data)
+
+    file_size = target_path.stat().st_size
+    delta = new_data_offset - old_data_offset
+    chunk_size = 16 * 1024 * 1024  # 16 MB chunk size
+    tensor_data_len = file_size - old_data_offset
+
+    with open(target_path, "r+b") as f:
+        if tensor_data_len > 0 and delta != 0:
+            if delta > 0:
+                cur_end = file_size
+                while cur_end > old_data_offset:
+                    cur_start = max(old_data_offset, cur_end - chunk_size)
+                    length = cur_end - cur_start
+                    f.seek(cur_start)
+                    buf = f.read(length)
+                    f.seek(cur_start + delta)
+                    f.write(buf)
+                    cur_end = cur_start
+            else:  # delta < 0
+                cur_start = old_data_offset
+                while cur_start < file_size:
+                    length = min(chunk_size, file_size - cur_start)
+                    f.seek(cur_start)
+                    buf = f.read(length)
+                    f.seek(cur_start + delta)
+                    f.write(buf)
+                    cur_start += length
+                f.truncate(file_size + delta)
+        elif tensor_data_len == 0:
+            f.truncate(new_data_offset)
+
+        f.seek(0)
+        f.write(new_pre_data)
+        f.flush()
+
+    return True
+
+
+def extract_gguf_metadata(target_path: Path | str, key: str) -> str | None:
+    """Extract a string metadata value from a GGUF file."""
+    target_path = Path(target_path)
+    if not target_path.is_file():
+        return None
+    reader = None
+    try:
+        reader = gguf.GGUFReader(target_path, "r")
+        field = reader.get_field(key)
+        if field is None:
+            return None
+        val = field.contents()
+        if isinstance(val, (bytes, bytearray, memoryview)):
+            return bytes(val).decode("utf-8")
+        return str(val)
+    except Exception:
+        return None
+    finally:
+        if reader is not None:
+            del reader
+            gc.collect()
+
+
+def extract_gguf_chat_template(target_path: Path | str) -> str | None:
+    """Extract the current tokenizer.chat_template from a GGUF file."""
+    return extract_gguf_metadata(target_path, Keys.Tokenizer.CHAT_TEMPLATE)
+
+
+def extract_gguf_backup(target_path: Path | str) -> str | None:
+    """Extract the backed-up chat template from tokenizer.chat_template.backup."""
+    return extract_gguf_metadata(target_path, f"{Keys.Tokenizer.CHAT_TEMPLATE}.backup")
+
+
+def restore_gguf_backup(target_path: Path | str) -> bool:
+    """Restore tokenizer.chat_template from tokenizer.chat_template.backup and remove the backup key."""
+    target_path = Path(target_path)
+    backup_template = extract_gguf_backup(target_path)
+    if backup_template is None:
+        print(
+            f"Error: No backup chat template found in '{target_path}' (missing '{Keys.Tokenizer.CHAT_TEMPLATE}.backup').",
+            file=sys.stderr,
+        )
+        return False
+    return gguf_set_metadata(
+        target_path,
+        {Keys.Tokenizer.CHAT_TEMPLATE: backup_template},
+        removals=[f"{Keys.Tokenizer.CHAT_TEMPLATE}.backup"],
+    )
+
+
 def patch_gguf(target_path: Path, minified_template: str, force: bool = False) -> bool | None:
     """Patch GGUF file metadata with a minified chat template.
 
-    Safely updates 'tokenizer.chat_template' using an adjacent temporary file
-    and atomic replacement, preserving tensors, architecture, alignment, and endianness.
+    Safely updates 'tokenizer.chat_template' in-place and preserves the original template
+    in 'tokenizer.chat_template.backup', maintaining tensors, architecture, alignment,
+    and endianness without duplicating tensor data.
     """
-    if gguf is None or getattr(gguf, "GGUFReader", None) is None:
-        print("Error: gguf package is required: pip install gguf", file=sys.stderr)
-        sys.exit(1)
-
     target_path = Path(target_path)
 
     # 1. Validate GGUF file existence and header magic
@@ -187,17 +472,38 @@ def patch_gguf(target_path: Path, minified_template: str, force: bool = False) -
         )
         sys.exit(1)
 
-    # 2. Validate GGUF file can be parsed
+    # 2. Validate the GGUF file can be parsed and inspect the existing template
+    existing_template: str | None = None
+    existing_backup: str | None = None
+    reader = None
     try:
         reader = gguf.GGUFReader(target_path, "r")
+        field = reader.get_field(Keys.Tokenizer.CHAT_TEMPLATE)
+        if field is not None:
+            val = field.contents()
+            if isinstance(val, (bytes, bytearray, memoryview)):
+                existing_template = bytes(val).decode("utf-8")
+            else:
+                existing_template = str(val)
+        bfield = reader.get_field(f"{Keys.Tokenizer.CHAT_TEMPLATE}.backup")
+        if bfield is not None:
+            bval = bfield.contents()
+            if isinstance(bval, (bytes, bytearray, memoryview)):
+                existing_backup = bytes(bval).decode("utf-8")
+            else:
+                existing_backup = str(bval)
     except Exception as e:
         print(f"Error: Failed to parse GGUF file '{target_path}': {e}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        if reader is not None:
+            del reader
+            gc.collect()
 
     # 3. Confirmation prompt if not forced
     if not force:
         print(
-            f"Warning: Modifying '{target_path}' in-place. No backup will be made for GGUF files.",
+            f"Warning: Modifying '{target_path}' in-place.",
             file=sys.stderr,
         )
         try:
@@ -207,74 +513,71 @@ def patch_gguf(target_path: Path, minified_template: str, force: bool = False) -
                 "Error: Standard input closed without confirmation. Use --force to patch non-interactively.",
                 file=sys.stderr,
             )
-            del reader
-            gc.collect()
             sys.exit(1)
         except KeyboardInterrupt:
             print("\nAborted.", file=sys.stderr)
-            del reader
-            gc.collect()
             sys.exit(1)
 
         if response.strip() != "YES":
             print("Aborted: Confirmation 'YES' was not received.", file=sys.stderr)
-            del reader
-            gc.collect()
             return False
 
-    # 4. Safe rewrite via an adjacent temporary file
-    temp_path: Path | None = None
+    # 4. Apply metadata update in-place
     try:
-        temp_fd, temp_path_str = tempfile.mkstemp(
-            dir=target_path.parent,
-            prefix=f".{target_path.name}.",
-            suffix=".tmp",
-        )
-        os.close(temp_fd)
-        temp_path = Path(temp_path_str)
-
-        arch = get_field_data(reader, Keys.General.ARCHITECTURE)
-        if isinstance(arch, bytes):
-            arch = arch.decode("utf-8")
-        elif arch is None:
-            arch = ""
-
-        writer = GGUFWriter(temp_path, arch=arch, endianess=reader.endianess)
-
-        alignment = get_field_data(reader, Keys.General.ALIGNMENT)
-        if alignment is None:
-            alignment = getattr(reader, "alignment", None)
-        if isinstance(alignment, (int, str, bytes)):
-            writer.data_alignment = int(alignment)
-
-        new_metadata = {
-            Keys.Tokenizer.CHAT_TEMPLATE: MetadataDetails(
-                GGUFValueType.STRING,
-                minified_template,
-            )
+        updates: dict[str, Any] = {
+            Keys.Tokenizer.CHAT_TEMPLATE: minified_template,
         }
+        if existing_backup is None and existing_template is not None:
+            updates[f"{Keys.Tokenizer.CHAT_TEMPLATE}.backup"] = existing_template
 
-        copy_with_new_metadata(reader, writer, new_metadata, [])
+        success = gguf_set_metadata(target_path, updates)
+        if not success:
+            print(f"Error: Failed to update GGUF metadata in '{target_path}'.", file=sys.stderr)
+            sys.exit(1)
 
-        # Release reader memmap before atomic replacement
-        del reader
-        gc.collect()
-
-        assert temp_path is not None
-        os.replace(temp_path, target_path)
-        temp_path = None
-        print(f"Updated 'tokenizer.chat_template' in '{target_path}'")
+        print(f"Updated '{Keys.Tokenizer.CHAT_TEMPLATE}' in '{target_path}'")
         return True
-
     except Exception as e:
         print(f"Error while updating GGUF metadata: {e}", file=sys.stderr)
         sys.exit(1)
-    finally:
-        if temp_path and temp_path.exists():
-            try:
-                temp_path.unlink()
-            except OSError:
-                pass
+
+
+def uninstall_gguf(target_path: Path | str) -> bool:
+    """Uninstall the chat template from GGUF file and restore from backup."""
+    target_path = Path(target_path)
+    if not target_path.is_file():
+        print(f"Error: Target path '{target_path}' is not a regular file.", file=sys.stderr)
+        sys.exit(1)
+
+    if not is_gguf_file(target_path):
+        print(
+            f"Error: '{target_path}' is not a valid GGUF file (missing GGUF magic header).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    backup_template = extract_gguf_backup(target_path)
+    if backup_template is None:
+        print(
+            f"Error: No backup chat template found in '{target_path}' (missing '{Keys.Tokenizer.CHAT_TEMPLATE}.backup').",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        success = gguf_set_metadata(
+            target_path,
+            {Keys.Tokenizer.CHAT_TEMPLATE: backup_template},
+            removals=[f"{Keys.Tokenizer.CHAT_TEMPLATE}.backup"],
+        )
+        if not success:
+            print(f"Error: Failed to restore backup in GGUF file '{target_path}'.", file=sys.stderr)
+            sys.exit(1)
+        print(f"Restored '{Keys.Tokenizer.CHAT_TEMPLATE}' from backup and removed backup key in '{target_path}'")
+        return True
+    except Exception as e:
+        print(f"Error while restoring GGUF backup metadata: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def extract_template_version(content: str) -> str:
@@ -562,7 +865,7 @@ def main(argv: list[str] | None = None) -> int:
         args = parse_args(argv)
         target_path = Path(args.model_path)
 
-        if not SOURCE_TEMPLATE_PATH.is_file():
+        if not args.uninstall and not SOURCE_TEMPLATE_PATH.is_file():
             print(
                 f"Error: Source chat template not found at '{SOURCE_TEMPLATE_PATH}'.",
                 file=sys.stderr,
@@ -577,6 +880,10 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         if target_path.is_dir():
+            if args.uninstall:
+                uninstall_directory(target_path)
+                print("Successfully uninstalled chat template from directory.")
+                return 0
             patch_directory(target_path, SOURCE_TEMPLATE_PATH)
             if not verify_directory(target_path, SOURCE_TEMPLATE_PATH):
                 print(
@@ -587,6 +894,10 @@ def main(argv: list[str] | None = None) -> int:
             print("Successfully applied chat template to directory.")
             return 0
         elif is_gguf_file(target_path):
+            if args.uninstall:
+                uninstall_gguf(target_path)
+                print("Successfully uninstalled chat template from GGUF.")
+                return 0
             template_content = SOURCE_TEMPLATE_PATH.read_text(encoding="utf-8")
             minified_template = minify_jinja(template_content)
             success = patch_gguf(target_path, minified_template, force=args.force)

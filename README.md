@@ -1,17 +1,17 @@
-# qwen3-honed-chat-templates
+# Qwen 3 Honed Chat Templates
 
-Honed chat templates for Qwen 3.x models.
+Honed chat templates for Qwen 3.x models with automated installation and uninstallation.
 
 # Installation
 
 The install script updates the chat templates for Qwen 3.x models in both Hugging Face and GGUF format.
 
-> [!WARNING]
-> 
-> The install script will overwrite existing chat templates. Ensure you have a backup of your chat templates before running the script.
-
-1. Ensure your model is on accessible storage.
+1. Ensure your model is in accessible storage.
 2. Run `python3 install.py <model_directory_or_gguf_file>`.
+
+# Uninstallation
+
+1. Run `python3 install.py --uninstall <model_directory_or_gguf_file>`.
 
 # References
 
