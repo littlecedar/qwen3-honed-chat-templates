@@ -63,7 +63,7 @@ SYSTEM_PROBE = "Be a pirate."
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Apply or uninstall the chat template for a model directory or GGUF file."
+        description="Backup existing chat template from a model directory or GGUF file and apply this chat template to it.  Alternatively, uninstall this chat template using template backup data."
     )
     parser.add_argument(
         "model_path",
@@ -79,7 +79,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--uninstall",
         action="store_true",
-        help="Revert model directory or GGUF file back to its pre-installation state using backup data",
+        help="Revert model directory or GGUF file back to its original chat template using backup data",
     )
     return parser.parse_args(argv)
 
