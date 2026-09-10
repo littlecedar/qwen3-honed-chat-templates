@@ -543,7 +543,7 @@ def patch_gguf(target_path: Path, minified_template: str, force: bool = False) -
 
 
 def uninstall_gguf(target_path: Path | str) -> bool:
-    """Uninstall the chat template from GGUF file and restore from backup."""
+    """Uninstall the chat template from the GGUF file and restore from backup."""
     target_path = Path(target_path)
     if not target_path.is_file():
         print(f"Error: Target path '{target_path}' is not a regular file.", file=sys.stderr)
