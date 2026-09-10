@@ -67,12 +67,13 @@ SYSTEM_PROBE = "Be a pirate."
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Backup existing chat template from a model directory or GGUF file and apply this chat template to it.  Alternatively, uninstall this chat template using template backup data."
+        description="Backup existing chat template from a model directory or GGUF file and apply this chat template to it. Alternatively, uninstall this chat template using template backup data. "
+        "For Hugging Face cached GGUF models, 'Snapshot Surgery' is performed in-place. NOTE: Run runtimes with HF_HUB_OFFLINE=1 to prevent Hub overwrites."
     )
     parser.add_argument(
         "model_path",
         type=str,
-        help="Path to the model directory (Hugging Face format) or .gguf file",
+        help="Target model: local directory path, local .gguf file, Hugging Face repo ID (e.g. 'owner/repo'), or HF GGUF target (e.g. 'owner/repo/file.gguf' or 'owner/repo:file.gguf')",
     )
     parser.add_argument(
         "--force",
@@ -242,6 +243,264 @@ def resolve_hf_model_path(
             f"Error: Invalid selection '{choice}'. Please enter a number [1-{len(revisions)}] or commit hash prefix.",
             file=sys.stderr,
         )
+
+
+def parse_hf_target(target: str) -> tuple[str, str | None] | None:
+    """Parse a target string into (repo_id, explicit_gguf_filename).
+
+    Returns None if the target is not a valid Hugging Face target pattern or
+    appears to be a local filesystem path.
+    """
+    if not target or not isinstance(target, str):
+        return None
+
+    # Local path indicators
+    if target.startswith((".", "/", "~")) or os.path.isabs(target):
+        return None
+
+    # Explicit file syntax: owner/repo/file.gguf or owner/repo:file.gguf
+    m = re.match(r"^([^/]+/[^/:]+)[:/](.+\.gguf)$", target, re.IGNORECASE)
+    if m:
+        repo_id, gguf_file = m.group(1), m.group(2)
+        if is_hf_repo_id(repo_id):
+            return repo_id, gguf_file
+
+    # Single-name repo with colon: repo:file.gguf
+    m_colon = re.match(r"^([^/:]+)[:](.+\.gguf)$", target, re.IGNORECASE)
+    if m_colon:
+        repo_id, gguf_file = m_colon.group(1), m_colon.group(2)
+        if is_hf_repo_id(repo_id):
+            return repo_id, gguf_file
+
+    # Plain repo_id: e.g. owner/repo or repo
+    # If it ends with .gguf without an explicit repo separator, it's considered a local .gguf file name
+    if is_hf_repo_id(target) and not target.lower().endswith(".gguf"):
+        return target, None
+
+    return None
+
+
+def find_snapshot_gguf_files(snapshot_dir: Path) -> list[Path]:
+    """Inspect cached snapshot directory and return all discovered GGUF files."""
+    snapshot_dir = Path(snapshot_dir)
+    if not snapshot_dir.is_dir():
+        return []
+    gguf_files: list[Path] = []
+    for p in sorted(snapshot_dir.rglob("*.gguf"), key=lambda x: str(x.relative_to(snapshot_dir)).lower()):
+        if p.is_file() and is_gguf_file(p):
+            gguf_files.append(p)
+    return gguf_files
+
+
+def format_size(size_bytes: int) -> str:
+    """Format bytes into human-readable size string."""
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(size_bytes)
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{size_bytes} B"
+
+
+def select_snapshot_gguf(
+    repo_id: str,
+    gguf_files: list[Path],
+    snapshot_dir: Path,
+    force: bool = False,
+) -> list[Path]:
+    """Select target GGUF file(s) from discovered snapshot files.
+
+    - If 1 GGUF file exists: auto-selects it.
+    - If multiple GGUF files exist:
+      - In forced or non-interactive workflows: fails with descriptive error.
+      - In interactive mode: prompts the user to select by index, filename, or 'all'.
+    """
+    if not gguf_files:
+        return []
+
+    if len(gguf_files) == 1:
+        return [gguf_files[0]]
+
+    # Multiple GGUF files found
+    if force:
+        print(
+            f"Error: Multiple GGUF files found in snapshot for '{repo_id}':",
+            file=sys.stderr,
+        )
+        for gf in gguf_files:
+            rel = gf.relative_to(snapshot_dir)
+            size_str = format_size(gf.stat().st_size)
+            print(f"  - {rel} ({size_str})", file=sys.stderr)
+        print(
+            f"In non-interactive or forced workflows, please specify a GGUF file (e.g. '{repo_id}/<filename>.gguf' or '{repo_id}:<filename>.gguf') or make an explicit selection path.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"Multiple GGUF files found in Hugging Face repository snapshot '{repo_id}':")
+    for i, gf in enumerate(gguf_files, 1):
+        rel = gf.relative_to(snapshot_dir)
+        size_str = format_size(gf.stat().st_size)
+        print(f"  [{i}] {rel} ({size_str})")
+    print("  [all] Select all discovered GGUF files")
+
+    prompt = f"Select a file [1-{len(gguf_files)}], filename, or 'all': "
+    while True:
+        try:
+            choice = input(prompt).strip()
+        except EOFError:
+            print(
+                f"\nError: Standard input was closed (EOF). Multiple GGUF files found in snapshot for '{repo_id}'. Please specify a GGUF file (e.g. '{repo_id}/<filename>.gguf' or '{repo_id}:<filename>.gguf') or make an explicit selection path.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        except KeyboardInterrupt:
+            print("\nAborted by user.", file=sys.stderr)
+            sys.exit(1)
+
+        if choice.lower() == "all":
+            return list(gguf_files)
+
+        if choice.isdigit():
+            idx = int(choice)
+            if 1 <= idx <= len(gguf_files):
+                return [gguf_files[idx - 1]]
+
+        # Match filename
+        clean_choice = choice.strip("'\"")
+        matches = [
+            gf
+            for gf in gguf_files
+            if gf.name.lower() == clean_choice.lower()
+            or str(gf.relative_to(snapshot_dir)).lower() == clean_choice.lower()
+        ]
+        if len(matches) == 1:
+            return matches
+        elif len(matches) > 1:
+            print(
+                f"Error: Ambiguous filename '{choice}'. Matches multiple files in snapshot.",
+                file=sys.stderr,
+            )
+            continue
+
+        print(
+            f"Error: Invalid selection '{choice}'. Please enter a number [1-{len(gguf_files)}], filename, or 'all'.",
+            file=sys.stderr,
+        )
+
+
+def resolve_snapshot_target(
+    repo_id: str,
+    snapshot_dir: Path,
+    explicit_file: str | None = None,
+    force: bool = False,
+) -> Path | list[Path]:
+    """Resolve target path(s) within a snapshot directory.
+
+    Returns:
+    - Path (directory): if no GGUF files are present in the snapshot (falls back to directory mode).
+    - list[Path]: list of selected GGUF file(s).
+    """
+    gguf_files = find_snapshot_gguf_files(snapshot_dir)
+
+    if explicit_file:
+        target_file = snapshot_dir / explicit_file
+        if target_file.is_file() and is_gguf_file(target_file):
+            return [target_file]
+        clean_file = explicit_file.strip("'\"")
+        matches = [
+            gf
+            for gf in gguf_files
+            if gf.name.lower() == clean_file.lower()
+            or str(gf.relative_to(snapshot_dir)).lower() == clean_file.lower()
+        ]
+        if len(matches) == 1:
+            return matches
+        elif len(matches) > 1:
+            print(
+                f"Error: Ambiguous GGUF target '{explicit_file}'. Matches multiple files in snapshot for '{repo_id}'.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        else:
+            print(
+                f"Error: GGUF file '{explicit_file}' not found in cached snapshot for '{repo_id}'.",
+                file=sys.stderr,
+            )
+            if gguf_files:
+                print("Available GGUF files in snapshot:", file=sys.stderr)
+                for gf in gguf_files:
+                    print(f"  - {gf.relative_to(snapshot_dir)}", file=sys.stderr)
+            sys.exit(1)
+
+    if not gguf_files:
+        return snapshot_dir
+
+    return select_snapshot_gguf(repo_id, gguf_files, snapshot_dir, force=force)
+
+
+def is_hf_cache_path(path: Path | str) -> bool:
+    """Check if a path is located within a Hugging Face cache directory."""
+    try:
+        p = Path(path)
+        resolved_p = p.resolve()
+        hf_cache = os.environ.get("HF_HUB_CACHE")
+        if hf_cache:
+            resolved_cache = Path(hf_cache).resolve()
+            if resolved_cache in p.parents or resolved_cache in resolved_p.parents:
+                return True
+        default_hf_cache = (Path.home() / ".cache" / "huggingface").resolve()
+        if default_hf_cache in p.parents or default_hf_cache in resolved_p.parents:
+            return True
+        if any(part.startswith("models--") for part in p.parts) or any(
+            part.startswith("models--") for part in resolved_p.parts
+        ):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def warn_snapshot_surgery(target_path: Path) -> None:
+    """Emit warning that Snapshot Surgery modifies the cache in-place
+    and HF_HUB_OFFLINE=1 is required during model runtime to prevent Hub overwrites.
+    """
+    print(
+        f"\n{YELLOW}{BOLD}Warning: Snapshot Surgery is being performed on the cached snapshot in-place at '{target_path}'.{RESET}\n"
+        f"{YELLOW}To prevent Hugging Face Hub from overwriting local changes, you must run model runtimes with HF_HUB_OFFLINE=1.{RESET}\n",
+        file=sys.stderr,
+    )
+
+
+def confirm_snapshot_surgery(force: bool = False) -> bool:
+    """Require explicit user confirmation ('Type \\'YES\\' to proceed') when force is False."""
+    if force:
+        return True
+    try:
+        response = input("Type 'YES' to proceed with Snapshot Surgery: ")
+    except EOFError:
+        print(
+            "Error: Standard input was closed without confirmation. Use --force to patch non-interactively.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nAborted.", file=sys.stderr)
+        sys.exit(1)
+
+    if response.strip() != "YES":
+        print("Aborted: Confirmation 'YES' was not received.", file=sys.stderr)
+        return False
+    return True
+
+
+def handle_snapshot_surgery(target_path: Path, force: bool = False) -> bool:
+    """Emit Snapshot Surgery warning and capture consent if not forced."""
+    warn_snapshot_surgery(target_path)
+    return confirm_snapshot_surgery(force=force)
 
 
 def backup_file(path: Path) -> Path:
@@ -719,6 +978,14 @@ def uninstall_gguf(target_path: Path | str) -> bool:
         if not success:
             print(f"Error: Failed to restore backup in GGUF file '{target_path}'.", file=sys.stderr)
             sys.exit(1)
+        restored_template = extract_gguf_chat_template(target_path)
+        remaining_backup = extract_gguf_backup(target_path)
+        if restored_template != backup_template or remaining_backup is not None:
+            print(
+                f"Error: GGUF uninstall verification failed for '{target_path}'.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         print(f"Restored '{Keys.Tokenizer.CHAT_TEMPLATE}' from backup and removed backup key in '{target_path}'")
         return True
     except Exception as e:
@@ -1018,29 +1285,83 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
 
+        selected_ggufs: list[Path] | None = None
+        hf_snapshot_path: Path | None = None
+
         if not target_path.exists():
-            if is_hf_repo_id(args.model_path) and not args.model_path.lower().endswith(".gguf"):
-                target_repo = find_cached_repo(args.model_path)
+            hf_target = parse_hf_target(args.model_path)
+            if hf_target is not None:
+                repo_id, explicit_file = hf_target
+                target_repo = find_cached_repo(repo_id)
                 if target_repo is None:
                     print(
-                        f"Error: Hugging Face model repository '{args.model_path}' not found in local cache.",
+                        f"Error: Hugging Face model repository '{repo_id}' not found in local cache.",
                         file=sys.stderr,
                     )
                     return 1
-                resolved_path = resolve_hf_model_path(args.model_path, latest=args.latest)
-                if resolved_path is None:
+                resolved_snapshot = resolve_hf_model_path(repo_id, latest=args.latest)
+                if resolved_snapshot is None:
                     print(
-                        f"Error: No valid snapshot directory found in cache for Hugging Face repository '{args.model_path}'.",
+                        f"Error: No valid snapshot directory found in cache for Hugging Face repository '{repo_id}'.",
                         file=sys.stderr,
                     )
                     return 1
-                target_path = resolved_path
+                resolved_target = resolve_snapshot_target(
+                    repo_id=repo_id,
+                    snapshot_dir=resolved_snapshot,
+                    explicit_file=explicit_file,
+                    force=args.force,
+                )
+                if isinstance(resolved_target, list):
+                    selected_ggufs = resolved_target
+                    hf_snapshot_path = resolved_snapshot
+                else:
+                    target_path = resolved_target
             else:
                 print(
                     f"Error: Target path does not exist: '{args.model_path}'",
                     file=sys.stderr,
                 )
                 return 1
+
+        if selected_ggufs is not None:
+            if args.uninstall:
+                backed_up_ggufs = [gf for gf in selected_ggufs if extract_gguf_backup(gf) is not None]
+                if not backed_up_ggufs:
+                    print(
+                        "Error: No backup chat template found in the selected cached Hugging Face GGUF file(s).",
+                        file=sys.stderr,
+                    )
+                    return 1
+                for gf in backed_up_ggufs:
+                    if not uninstall_gguf(gf):
+                        return 1
+                if len(backed_up_ggufs) == 1:
+                    print(
+                        "Successfully restored the original chat template in the cached Hugging Face GGUF file."
+                    )
+                else:
+                    print(
+                        f"Successfully restored the original chat template in {len(backed_up_ggufs)} cached Hugging Face GGUF files."
+                    )
+                return 0
+            target_snap = hf_snapshot_path if hf_snapshot_path is not None else selected_ggufs[0].parent
+            if not handle_snapshot_surgery(target_snap, force=args.force):
+                return 1
+            template_content = SOURCE_TEMPLATE_PATH.read_text(encoding="utf-8")
+            minified_template = minify_jinja(template_content)
+            for gf in selected_ggufs:
+                success = patch_gguf(gf, minified_template, force=True)
+                if not success:
+                    return 0
+                if not verify_gguf(gf, SOURCE_TEMPLATE_PATH):
+                    print(
+                        f"{RED}Error: Verification failed for GGUF file '{gf}'.{RESET}",
+                        file=sys.stderr,
+                    )
+                    return 1
+            print("Successfully applied chat template to GGUF.")
+            return 0
 
         if target_path.is_dir():
             if args.uninstall:
@@ -1061,9 +1382,15 @@ def main(argv: list[str] | None = None) -> int:
                 uninstall_gguf(target_path)
                 print("Successfully uninstalled chat template from GGUF.")
                 return 0
+            if is_hf_cache_path(target_path):
+                if not handle_snapshot_surgery(target_path.parent, force=args.force):
+                    return 1
+                force = True
+            else:
+                force = args.force
             template_content = SOURCE_TEMPLATE_PATH.read_text(encoding="utf-8")
             minified_template = minify_jinja(template_content)
-            success = patch_gguf(target_path, minified_template, force=args.force)
+            success = patch_gguf(target_path, minified_template, force=force)
             if not success:
                 return 0
             if not verify_gguf(target_path, SOURCE_TEMPLATE_PATH):

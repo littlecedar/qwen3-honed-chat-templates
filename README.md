@@ -23,13 +23,32 @@ uv run install.py --force example-model.gguf
 ```
 
 ## Run for Hugging Face Models
-
+### Directory Models
 ```bash
 uv run install.py example/model
 ```
 Or to automatically select the most recent model revision:
 ```bash
 uv run install.py --latest example/model
+```
+
+### Cached GGUF Models (Snapshot Surgery)
+You can patch GGUF files directly inside your Hugging Face cache.
+
+> **Warning**: This performs "Snapshot Surgery" — modifying your cache in-place.
+> Always run your model runtime with `HF_HUB_OFFLINE=1` to prevent Hugging Face from automatically overwriting these changes.
+
+```bash
+# Patch a repo ID (auto-discovers GGUF files)
+uv run install.py Qwen/Qwen2.5-7B-Instruct-GGUF
+
+# Patch a specific GGUF file
+uv run install.py Qwen/Qwen2.5-7B-Instruct-GGUF/q4_k_m.gguf
+# Or using colon syntax
+uv run install.py Qwen/Qwen2.5-7B-Instruct-GGUF:q4_k_m.gguf
+
+# Bypass interactive consent
+uv run install.py --force Qwen/Qwen2.5-7B-Instruct-GGUF
 ```
 
 # Uninstallation

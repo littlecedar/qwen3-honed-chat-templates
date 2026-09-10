@@ -132,8 +132,10 @@ class TestApplyChatTemplate(unittest.TestCase):
         filename: str = "model.gguf",
         template: str = "old jinja template",
         alignment: int = 64,
+        target_dir: Path | None = None,
     ):
-        path = self.test_dir / filename
+        base_dir = target_dir if target_dir is not None else self.test_dir
+        path = base_dir / filename
         writer = gguf.GGUFWriter(path, arch="qwen2")
         writer.add_chat_template(template)
         writer.data_alignment = alignment
@@ -170,11 +172,15 @@ class TestApplyChatTemplate(unittest.TestCase):
                 {"tokenizer_config.json": json.dumps({"chat_template": "old_template_content"})},
             )
             mtime = rev.get("last_modified", 1000.0)
-            for fname, fcontent in files.items():
-                fpath = snap_dir / fname
-                fpath.parent.mkdir(parents=True, exist_ok=True)
-                fpath.write_text(fcontent, encoding="utf-8")
-                os.utime(fpath, (mtime, mtime))
+            if files:
+                for fname, fcontent in files.items():
+                    fpath = snap_dir / fname
+                    fpath.parent.mkdir(parents=True, exist_ok=True)
+                    if isinstance(fcontent, bytes):
+                        fpath.write_bytes(fcontent)
+                    else:
+                        fpath.write_text(fcontent, encoding="utf-8")
+                    os.utime(fpath, (mtime, mtime))
             os.utime(snap_dir, (mtime, mtime))
 
             refs = rev.get("refs", [])
@@ -741,6 +747,93 @@ class TestApplyChatTemplate(unittest.TestCase):
         )
         self.assertEqual(install.extract_gguf_chat_template(gguf_path), "stock template")
 
+    def test_hf_repo_gguf_uninstall_restores_single_cached_file(self):
+        """PASS: --uninstall by HF repo restores one cached GGUF and removes its backup key; FAIL: Cached metadata remains patched."""
+        commit = "c" * 40
+        self.create_synthetic_hf_repo("testorg/uninstall-single-gguf", [{"commit_hash": commit, "files": {}}])
+        snap_dir = self.hf_cache_dir / "models--testorg--uninstall-single-gguf" / "snapshots" / commit
+        gguf_path, _ = self.create_synthetic_gguf(
+            "model-q4.gguf", template="cached stock template", target_dir=snap_dir
+        )
+
+        patch_res = self.run_script(
+            "testorg/uninstall-single-gguf",
+            "--force",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(patch_res.returncode, 0, msg=f"HF GGUF patch failed: {patch_res.stderr}")
+        self.assertEqual(install.extract_gguf_backup(gguf_path), "cached stock template")
+
+        uninstall_res = self.run_script(
+            "testorg/uninstall-single-gguf",
+            "--uninstall",
+            "--force",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(uninstall_res.returncode, 0, msg=f"HF GGUF uninstall failed: {uninstall_res.stderr}")
+        self.assertIn("cached Hugging Face GGUF file", uninstall_res.stdout)
+        self.assertEqual(install.extract_gguf_chat_template(gguf_path), "cached stock template")
+        self.assertIsNone(install.extract_gguf_backup(gguf_path))
+
+    def test_hf_repo_gguf_uninstall_explicit_slash_and_colon_targets(self):
+        """PASS: Explicit HF slash and colon GGUF targets uninstall only the requested cached file; FAIL: Other files are changed or target syntax fails."""
+        commit = "d" * 40
+        self.create_synthetic_hf_repo("testorg/uninstall-explicit-gguf", [{"commit_hash": commit, "files": {}}])
+        snap_dir = self.hf_cache_dir / "models--testorg--uninstall-explicit-gguf" / "snapshots" / commit
+        q4, _ = self.create_synthetic_gguf("q4.gguf", template="q4 stock", target_dir=snap_dir)
+        q8, _ = self.create_synthetic_gguf("q8.gguf", template="q8 stock", target_dir=snap_dir)
+
+        for target, selected, untouched in (
+            ("testorg/uninstall-explicit-gguf/q4.gguf", q4, q8),
+            ("testorg/uninstall-explicit-gguf:q8.gguf", q8, q4),
+        ):
+            original = f"{selected.stem} stock"
+            patch_res = self.run_script(target, "--force", env={"HF_HUB_CACHE": str(self.hf_cache_dir)})
+            self.assertEqual(patch_res.returncode, 0, msg=f"Patch failed for {target}: {patch_res.stderr}")
+            uninstall_res = self.run_script(
+                target,
+                "--uninstall",
+                "--force",
+                env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+            )
+            self.assertEqual(
+                uninstall_res.returncode,
+                0,
+                msg=f"Uninstall failed for {target}: {uninstall_res.stderr}",
+            )
+            self.assertEqual(install.extract_gguf_chat_template(selected), original)
+            self.assertIsNone(install.extract_gguf_backup(selected))
+            self.assertIsNone(install.extract_gguf_backup(untouched))
+
+    def test_hf_repo_gguf_uninstall_all_selected_files(self):
+        """PASS: Interactive 'all' selection uninstalls every patched cached GGUF; FAIL: Any backup key or patched template remains."""
+        commit = "e" * 40
+        self.create_synthetic_hf_repo("testorg/uninstall-all-gguf", [{"commit_hash": commit, "files": {}}])
+        snap_dir = self.hf_cache_dir / "models--testorg--uninstall-all-gguf" / "snapshots" / commit
+        q4, _ = self.create_synthetic_gguf("q4.gguf", template="q4 stock", target_dir=snap_dir)
+        q8, _ = self.create_synthetic_gguf("q8.gguf", template="q8 stock", target_dir=snap_dir)
+
+        patch_res = self.run_script(
+            "testorg/uninstall-all-gguf",
+            input="all\nYES\n",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(patch_res.returncode, 0, msg=f"Patch all failed: {patch_res.stderr}")
+        self.assertEqual(install.extract_gguf_backup(q4), "q4 stock")
+        self.assertEqual(install.extract_gguf_backup(q8), "q8 stock")
+
+        uninstall_res = self.run_script(
+            "testorg/uninstall-all-gguf",
+            "--uninstall",
+            input="all\n",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(uninstall_res.returncode, 0, msg=f"Uninstall all failed: {uninstall_res.stderr}")
+        self.assertIn("2 cached Hugging Face GGUF files", uninstall_res.stdout)
+        for path, original in ((q4, "q4 stock"), (q8, "q8 stock")):
+            self.assertEqual(install.extract_gguf_chat_template(path), original)
+            self.assertIsNone(install.extract_gguf_backup(path))
+
     def test_verify_directory_success(self):
         """PASS: verify_directory returns True when directory template files match repository template; FAIL: Returns False for matching templates."""
         model_dir = self.test_dir / "verify_dir_ok"
@@ -1254,6 +1347,501 @@ class TestApplyChatTemplate(unittest.TestCase):
             expected_stderr="Error: Target path does not exist: 'missing_model.gguf'",
             expected_exit_code=1,
         )
+
+    def test_parse_hf_target(self):
+        """PASS: parse_hf_target correctly parses repo IDs and explicit GGUF filenames; FAIL: Misparses or returns invalid."""
+        # Plain repo IDs
+        self.assertEqual(
+            install.parse_hf_target("Qwen/Qwen2.5-7B-Instruct-GGUF"),
+            ("Qwen/Qwen2.5-7B-Instruct-GGUF", None),
+        )
+        self.assertEqual(
+            install.parse_hf_target("testorg/model"),
+            ("testorg/model", None),
+        )
+
+        # Explicit GGUF subpaths with slash
+        self.assertEqual(
+            install.parse_hf_target("Qwen/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q4_k_m.gguf"),
+            ("Qwen/Qwen2.5-7B-Instruct-GGUF", "qwen2.5-7b-instruct-q4_k_m.gguf"),
+        )
+        self.assertEqual(
+            install.parse_hf_target("testorg/model/subfolder/q4.gguf"),
+            ("testorg/model", "subfolder/q4.gguf"),
+        )
+
+        # Explicit GGUF subpaths with colon
+        self.assertEqual(
+            install.parse_hf_target("Qwen/Qwen2.5-7B-Instruct-GGUF:qwen2.5-7b-instruct-q4_k_m.gguf"),
+            ("Qwen/Qwen2.5-7B-Instruct-GGUF", "qwen2.5-7b-instruct-q4_k_m.gguf"),
+        )
+        self.assertEqual(
+            install.parse_hf_target("gpt2:model.gguf"),
+            ("gpt2", "model.gguf"),
+        )
+
+        # Local filesystem paths / non-HF targets rejected
+        self.assertIsNone(install.parse_hf_target("missing_model.gguf"))
+        self.assertIsNone(install.parse_hf_target("./relative_dir/model.gguf"))
+        self.assertIsNone(install.parse_hf_target("../parent/model.gguf"))
+        self.assertIsNone(install.parse_hf_target("/absolute/path/model.gguf"))
+        self.assertIsNone(install.parse_hf_target("local_folder/missing.gguf"))
+        self.assertIsNone(install.parse_hf_target(""))
+        self.assertIsNone(install.parse_hf_target(None))
+
+    def test_find_snapshot_gguf_files(self):
+        """PASS: find_snapshot_gguf_files returns all valid GGUF files in snapshot, including nested and symlinked; FAIL: Misses files or crashes."""
+        snap_dir = self.test_dir / "snap_discovery"
+        snap_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Empty directory
+        self.assertEqual(install.find_snapshot_gguf_files(snap_dir), [])
+        self.assertEqual(install.find_snapshot_gguf_files(self.test_dir / "nonexistent"), [])
+
+        # 2. Text files only
+        (snap_dir / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+        (snap_dir / "README.md").write_text("# Test", encoding="utf-8")
+        self.assertEqual(install.find_snapshot_gguf_files(snap_dir), [])
+
+        # 3. Direct GGUF file
+        g1, _ = self.create_synthetic_gguf("model-q4.gguf", target_dir=snap_dir)
+        found = install.find_snapshot_gguf_files(snap_dir)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].name, "model-q4.gguf")
+
+        # 4. Nested GGUF file in subfolder
+        sub = snap_dir / "nested"
+        sub.mkdir(parents=True, exist_ok=True)
+        g2, _ = self.create_synthetic_gguf("model-q8.gguf", target_dir=sub)
+        found = install.find_snapshot_gguf_files(snap_dir)
+        self.assertEqual(len(found), 2)
+        names = [f.name for f in found]
+        self.assertIn("model-q4.gguf", names)
+        self.assertIn("model-q8.gguf", names)
+
+        # 5. Symlinked GGUF to blob
+        blobs_dir = self.test_dir / "blobs_test"
+        blobs_dir.mkdir(parents=True, exist_ok=True)
+        blob_path, _ = self.create_synthetic_gguf("blob_hash_1234", target_dir=blobs_dir)
+        symlink_path = snap_dir / "model-symlink.gguf"
+        symlink_path.symlink_to(blob_path)
+        found = install.find_snapshot_gguf_files(snap_dir)
+        self.assertEqual(len(found), 3)
+        names = [f.name for f in found]
+        self.assertIn("model-symlink.gguf", names)
+        # Verify relative_to works
+        for f in found:
+            self.assertTrue(str(f.relative_to(snap_dir)))
+
+    def test_hf_repo_single_gguf_auto_selected(self):
+        """PASS: HF repo snapshot with a single GGUF auto-selects and patches the GGUF with --force; FAIL: Prompts or crashes."""
+        commit = "1" * 40
+        self.create_synthetic_hf_repo("testorg/single-gguf", [{"commit_hash": commit, "files": {}}])
+        snap_dir = self.hf_cache_dir / "models--testorg--single-gguf" / "snapshots" / commit
+        self.create_synthetic_gguf("model-q4_k_m.gguf", target_dir=snap_dir)
+
+        res = self.run_script(
+            "testorg/single-gguf",
+            "--force",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res.returncode, 0, msg=f"Script failed: {res.stderr}")
+        self.assertIn("Successfully applied chat template to GGUF.", res.stdout)
+        self.assertTrue(install.verify_gguf(snap_dir / "model-q4_k_m.gguf", SOURCE_TEMPLATE))
+
+    def test_hf_repo_explicit_target_slash_and_colon(self):
+        """PASS: Explicit repo_id/file.gguf and repo_id:file.gguf patch only the specified GGUF; FAIL: Disambiguation prompt or wrong file."""
+        commit = "2" * 40
+        self.create_synthetic_hf_repo("testorg/explicit-target", [{"commit_hash": commit, "files": {}}])
+        snap_dir = self.hf_cache_dir / "models--testorg--explicit-target" / "snapshots" / commit
+        self.create_synthetic_gguf("q4.gguf", target_dir=snap_dir)
+        self.create_synthetic_gguf("q8.gguf", target_dir=snap_dir)
+
+        # 1. Target with slash: repo_id/q4.gguf
+        res_slash = self.run_script(
+            "testorg/explicit-target/q4.gguf",
+            "--force",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res_slash.returncode, 0, msg=f"Slash target failed: {res_slash.stderr}")
+        self.assertIn("Successfully applied chat template to GGUF.", res_slash.stdout)
+        self.assertTrue(install.verify_gguf(snap_dir / "q4.gguf", SOURCE_TEMPLATE))
+        # q8.gguf should remain unpatched
+        check_expected_verification_failure(
+            self,
+            install.verify_gguf,
+            snap_dir / "q8.gguf",
+            SOURCE_TEMPLATE,
+            description="q8.gguf remained unpatched after q4.gguf patch",
+        )
+
+        # 2. Target with colon: repo_id:q8.gguf
+        res_colon = self.run_script(
+            "testorg/explicit-target:q8.gguf",
+            "--force",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res_colon.returncode, 0, msg=f"Colon target failed: {res_colon.stderr}")
+        self.assertIn("Successfully applied chat template to GGUF.", res_colon.stdout)
+        self.assertTrue(install.verify_gguf(snap_dir / "q8.gguf", SOURCE_TEMPLATE))
+
+    def test_hf_repo_explicit_target_missing(self):
+        """PASS: Explicit GGUF file target not found in snapshot reports error and exits with code 1; FAIL: Ignores missing file."""
+        commit = "3" * 40
+        self.create_synthetic_hf_repo("testorg/explicit-missing", [{"commit_hash": commit, "files": {}}])
+        snap_dir = self.hf_cache_dir / "models--testorg--explicit-missing" / "snapshots" / commit
+        self.create_synthetic_gguf("q4.gguf", target_dir=snap_dir)
+
+        res = self.run_script(
+            "testorg/explicit-missing/nonexistent.gguf",
+            "--force",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assert_subprocess_failure(
+            res,
+            description="Explicit GGUF target not in snapshot",
+            expected_stderr="GGUF file 'nonexistent.gguf' not found in cached snapshot",
+            expected_exit_code=1,
+        )
+
+    def test_hf_repo_multiple_ggufs_forced_requires_explicit_target(self):
+        """PASS: Passing --force on HF repo with multiple GGUFs without explicit target fails with descriptive error; FAIL: Guesses or passes."""
+        commit = "4" * 40
+        self.create_synthetic_hf_repo("testorg/multi-forced", [{"commit_hash": commit, "files": {}}])
+        snap_dir = self.hf_cache_dir / "models--testorg--multi-forced" / "snapshots" / commit
+        self.create_synthetic_gguf("q4.gguf", target_dir=snap_dir)
+        self.create_synthetic_gguf("q8.gguf", target_dir=snap_dir)
+
+        res = self.run_script(
+            "testorg/multi-forced",
+            "--force",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assert_subprocess_failure(
+            res,
+            description="Multiple GGUFs with --force without explicit target",
+            expected_stderr="Multiple GGUF files found in snapshot",
+            expected_exit_code=1,
+        )
+        self.assertIn("specify a gguf file", res.stderr.lower())
+        self.assertIn("explicit selection path", res.stderr.lower())
+
+    def test_hf_repo_multiple_ggufs_eof_fails_descriptive(self):
+        """PASS: Non-interactive/closed stdin on HF repo with multiple GGUFs fails with descriptive error; FAIL: Crashes or hangs."""
+        commit = "5" * 40
+        self.create_synthetic_hf_repo("testorg/multi-eof", [{"commit_hash": commit, "files": {}}])
+        snap_dir = self.hf_cache_dir / "models--testorg--multi-eof" / "snapshots" / commit
+        self.create_synthetic_gguf("q4.gguf", target_dir=snap_dir)
+        self.create_synthetic_gguf("q8.gguf", target_dir=snap_dir)
+
+        res = self.run_script(
+            "testorg/multi-eof",
+            input="",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assert_subprocess_failure(
+            res,
+            description="Multiple GGUFs with EOF stdin",
+            expected_stderr="standard input was closed (eof)",
+            expected_exit_code=1,
+        )
+        self.assertIn("specify a gguf file", res.stderr.lower())
+        self.assertIn("explicit selection path", res.stderr.lower())
+
+    def test_hf_repo_multiple_ggufs_interactive_index(self):
+        """PASS: Interactive selection by index '1' patches first GGUF and leaves second untouched; FAIL: Selects wrong or fails."""
+        commit = "6" * 40
+        self.create_synthetic_hf_repo("testorg/multi-idx", [{"commit_hash": commit, "files": {}}])
+        snap_dir = self.hf_cache_dir / "models--testorg--multi-idx" / "snapshots" / commit
+        self.create_synthetic_gguf("q4.gguf", target_dir=snap_dir)
+        self.create_synthetic_gguf("q8.gguf", target_dir=snap_dir)
+
+        res = self.run_script(
+            "testorg/multi-idx",
+            input="1\nYES\n",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res.returncode, 0, msg=f"Interactive selection failed: {res.stderr}")
+        self.assertIn("Successfully applied chat template to GGUF.", res.stdout)
+        self.assertTrue(install.verify_gguf(snap_dir / "q4.gguf", SOURCE_TEMPLATE))
+        check_expected_verification_failure(
+            self,
+            install.verify_gguf,
+            snap_dir / "q8.gguf",
+            SOURCE_TEMPLATE,
+            description="q8.gguf untouched in index selection test",
+        )
+
+    def test_hf_repo_multiple_ggufs_interactive_filename(self):
+        """PASS: Interactive selection by filename 'q8.gguf' patches specified GGUF; FAIL: Rejects filename selection."""
+        commit = "7" * 40
+        self.create_synthetic_hf_repo("testorg/multi-file", [{"commit_hash": commit, "files": {}}])
+        snap_dir = self.hf_cache_dir / "models--testorg--multi-file" / "snapshots" / commit
+        self.create_synthetic_gguf("q4.gguf", target_dir=snap_dir)
+        self.create_synthetic_gguf("q8.gguf", target_dir=snap_dir)
+
+        res = self.run_script(
+            "testorg/multi-file",
+            input="q8.gguf\nYES\n",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res.returncode, 0, msg=f"Filename selection failed: {res.stderr}")
+        self.assertIn("Successfully applied chat template to GGUF.", res.stdout)
+        self.assertTrue(install.verify_gguf(snap_dir / "q8.gguf", SOURCE_TEMPLATE))
+        check_expected_verification_failure(
+            self,
+            install.verify_gguf,
+            snap_dir / "q4.gguf",
+            SOURCE_TEMPLATE,
+            description="q4.gguf untouched in filename selection test",
+        )
+
+    def test_hf_repo_multiple_ggufs_interactive_all(self):
+        """PASS: Interactive selection 'all' patches all discovered GGUF files in snapshot; FAIL: Leaves files unpatched."""
+        commit = "8" * 40
+        self.create_synthetic_hf_repo("testorg/multi-all", [{"commit_hash": commit, "files": {}}])
+        snap_dir = self.hf_cache_dir / "models--testorg--multi-all" / "snapshots" / commit
+        self.create_synthetic_gguf("q4.gguf", target_dir=snap_dir)
+        self.create_synthetic_gguf("q8.gguf", target_dir=snap_dir)
+
+        res = self.run_script(
+            "testorg/multi-all",
+            input="all\nYES\n",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res.returncode, 0, msg=f"Select all failed: {res.stderr}")
+        self.assertIn("Successfully applied chat template to GGUF.", res.stdout)
+        self.assertTrue(install.verify_gguf(snap_dir / "q4.gguf", SOURCE_TEMPLATE))
+        self.assertTrue(install.verify_gguf(snap_dir / "q8.gguf", SOURCE_TEMPLATE))
+
+    def test_hf_repo_multiple_ggufs_interactive_retry(self):
+        """PASS: Invalid input prompts user again and succeeds upon valid input; FAIL: Aborts on first invalid input."""
+        commit = "9" * 40
+        self.create_synthetic_hf_repo("testorg/multi-retry-gguf", [{"commit_hash": commit, "files": {}}])
+        snap_dir = self.hf_cache_dir / "models--testorg--multi-retry-gguf" / "snapshots" / commit
+        self.create_synthetic_gguf("q4.gguf", target_dir=snap_dir)
+        self.create_synthetic_gguf("q8.gguf", target_dir=snap_dir)
+
+        res = self.run_script(
+            "testorg/multi-retry-gguf",
+            input="invalid_choice\n1\nYES\n",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res.returncode, 0, msg=f"Retry failed: {res.stderr}")
+        self.assertIn("Invalid selection 'invalid_choice'", res.stderr)
+        self.assertTrue(install.verify_gguf(snap_dir / "q4.gguf", SOURCE_TEMPLATE))
+
+    def test_hf_repo_fallback_to_directory_mode(self):
+        """PASS: HF repo without GGUF files seamlessly falls back to directory patching mode; FAIL: Fails or misses directory."""
+        commit = "d" * 40
+        self.create_synthetic_hf_repo("testorg/fallback-dir", [{"commit_hash": commit}])
+        snap_dir = self.hf_cache_dir / "models--testorg--fallback-dir" / "snapshots" / commit
+
+        res = self.run_script(
+            "testorg/fallback-dir",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res.returncode, 0, msg=f"Fallback failed: {res.stderr}")
+        self.assertIn("Successfully applied chat template to directory.", res.stdout)
+        self.assertTrue((snap_dir / "chat_template.jinja").is_file())
+        self.assertTrue((snap_dir / "tokenizer_config.json.bak").is_file())
+        self.assertTrue(install.verify_directory(snap_dir, SOURCE_TEMPLATE))
+
+    def test_warn_snapshot_surgery_output(self):
+        """PASS: warn_snapshot_surgery emits warning with Snapshot Surgery, HF_HUB_OFFLINE=1, and target path; FAIL: Omits required warning details."""
+        buf = io.StringIO()
+        target = Path("/tmp/fake/snapshot/dir")
+        with contextlib.redirect_stderr(buf):
+            install.warn_snapshot_surgery(target)
+        output = buf.getvalue()
+        self.assertIn("Snapshot Surgery", output)
+        self.assertIn("HF_HUB_OFFLINE=1", output)
+        self.assertIn(str(target), output)
+        self.assertIn("in-place", output.lower())
+
+    def test_confirm_snapshot_surgery_force(self):
+        """PASS: confirm_snapshot_surgery returns True immediately when force=True; FAIL: Prompts or returns False."""
+        self.assertTrue(install.confirm_snapshot_surgery(force=True))
+
+    def test_confirm_snapshot_surgery_interactive_yes(self):
+        """PASS: confirm_snapshot_surgery returns True when user types YES; FAIL: Returns False or raises."""
+        with mock.patch("builtins.input", return_value="YES"):
+            self.assertTrue(install.confirm_snapshot_surgery(force=False))
+
+    def test_confirm_snapshot_surgery_interactive_no(self):
+        """PASS: confirm_snapshot_surgery returns False and prints abort message when user does not enter YES; FAIL: Returns True or omits message."""
+        buf = io.StringIO()
+        with mock.patch("builtins.input", return_value="NO"):
+            with contextlib.redirect_stderr(buf):
+                result = install.confirm_snapshot_surgery(force=False)
+        self.assertFalse(result)
+        self.assertIn("Aborted: Confirmation 'YES' was not received.", buf.getvalue())
+
+    def test_confirm_snapshot_surgery_eof(self):
+        """PASS: confirm_snapshot_surgery exits with code 1 when EOFError is raised; FAIL: Doesn't exit or wrong code."""
+        with mock.patch("builtins.input", side_effect=EOFError):
+            with self.assertRaises(SystemExit) as ctx:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    install.confirm_snapshot_surgery(force=False)
+            self.assertEqual(ctx.exception.code, 1)
+
+    def test_confirm_snapshot_surgery_keyboard_interrupt(self):
+        """PASS: confirm_snapshot_surgery exits with code 1 when KeyboardInterrupt is raised; FAIL: Doesn't exit or wrong code."""
+        with mock.patch("builtins.input", side_effect=KeyboardInterrupt):
+            with self.assertRaises(SystemExit) as ctx:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    install.confirm_snapshot_surgery(force=False)
+            self.assertEqual(ctx.exception.code, 1)
+
+    def test_snapshot_surgery_warning_and_offline_notice_with_force(self):
+        """PASS: Snapshot Surgery emits HF_HUB_OFFLINE=1 and Snapshot Surgery warning even with --force; FAIL: Omits warning."""
+        commit = "a" * 40
+        self.create_synthetic_hf_repo("testorg/warn-force", [{"commit_hash": commit, "files": {}}])
+        snap_dir = self.hf_cache_dir / "models--testorg--warn-force" / "snapshots" / commit
+        self.create_synthetic_gguf("model.gguf", target_dir=snap_dir)
+
+        res = self.run_script(
+            "testorg/warn-force",
+            "--force",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res.returncode, 0, msg=f"Script failed: {res.stderr}")
+        self.assertIn("Snapshot Surgery", res.stderr)
+        self.assertIn("HF_HUB_OFFLINE=1", res.stderr)
+
+    def test_hf_repo_explicit_target_syntax_slash(self):
+        """PASS: Explicit slash target syntax patches the target GGUF; FAIL: Patches wrong file or fails."""
+        commit = "b" * 40
+        self.create_synthetic_hf_repo("testorg/explicit-slash", [{"commit_hash": commit, "files": {}}])
+        snap_dir = self.hf_cache_dir / "models--testorg--explicit-slash" / "snapshots" / commit
+        self.create_synthetic_gguf("q4.gguf", target_dir=snap_dir)
+        self.create_synthetic_gguf("q8.gguf", target_dir=snap_dir)
+
+        res = self.run_script(
+            "testorg/explicit-slash/q4.gguf",
+            "--force",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res.returncode, 0, msg=f"Script failed: {res.stderr}")
+        self.assertTrue(install.verify_gguf(snap_dir / "q4.gguf", SOURCE_TEMPLATE))
+        check_expected_verification_failure(
+            self,
+            install.verify_gguf,
+            snap_dir / "q8.gguf",
+            SOURCE_TEMPLATE,
+            description="q8.gguf untouched in slash target test",
+        )
+
+    def test_hf_repo_explicit_target_syntax_colon(self):
+        """PASS: Explicit colon target syntax patches the target GGUF; FAIL: Patches wrong file or fails."""
+        commit = "c" * 40
+        self.create_synthetic_hf_repo("testorg/explicit-colon", [{"commit_hash": commit, "files": {}}])
+        snap_dir = self.hf_cache_dir / "models--testorg--explicit-colon" / "snapshots" / commit
+        self.create_synthetic_gguf("q4.gguf", target_dir=snap_dir)
+        self.create_synthetic_gguf("q8.gguf", target_dir=snap_dir)
+
+        res = self.run_script(
+            "testorg/explicit-colon:q8.gguf",
+            "--force",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res.returncode, 0, msg=f"Script failed: {res.stderr}")
+        self.assertTrue(install.verify_gguf(snap_dir / "q8.gguf", SOURCE_TEMPLATE))
+        check_expected_verification_failure(
+            self,
+            install.verify_gguf,
+            snap_dir / "q4.gguf",
+            SOURCE_TEMPLATE,
+            description="q4.gguf untouched in colon target test",
+        )
+
+    def test_snapshot_surgery_interactive_yes_succeeds(self):
+        """PASS: Single GGUF HF snapshot prompts for Snapshot Surgery consent, succeeds on YES, and patches GGUF; FAIL: Fails or leaves unpatched."""
+        commit = "b" * 40
+        self.create_synthetic_hf_repo("testorg/consent-yes", [{"commit_hash": commit, "files": {}}])
+        snap_dir = self.hf_cache_dir / "models--testorg--consent-yes" / "snapshots" / commit
+        self.create_synthetic_gguf("model.gguf", target_dir=snap_dir)
+
+        res = self.run_script(
+            "testorg/consent-yes",
+            input="YES\n",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res.returncode, 0, msg=f"Script failed: {res.stderr}")
+        self.assertIn("Snapshot Surgery", res.stderr)
+        self.assertIn("HF_HUB_OFFLINE=1", res.stderr)
+        self.assertIn("Successfully applied chat template to GGUF.", res.stdout)
+        self.assertTrue(install.verify_gguf(snap_dir / "model.gguf", SOURCE_TEMPLATE))
+
+    def test_snapshot_surgery_interactive_no_aborts_cleanly(self):
+        """PASS: Declining Snapshot Surgery confirmation aborts cleanly with exit code 1 and leaves file unmodified; FAIL: Patches file or returns 0."""
+        commit = "c" * 40
+        self.create_synthetic_hf_repo("testorg/consent-no", [{"commit_hash": commit, "files": {}}])
+        snap_dir = self.hf_cache_dir / "models--testorg--consent-no" / "snapshots" / commit
+        self.create_synthetic_gguf("model.gguf", template="unmodified pre-patch", target_dir=snap_dir)
+
+        res = self.run_script(
+            "testorg/consent-no",
+            input="NO\n",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res.returncode, 1, msg=f"Expected exit code 1, got {res.returncode}")
+        self.assertIn("Snapshot Surgery", res.stderr)
+        self.assertIn("HF_HUB_OFFLINE=1", res.stderr)
+        self.assertIn("Aborted: Confirmation 'YES' was not received.", res.stderr)
+
+        reader = gguf.GGUFReader(snap_dir / "model.gguf", "r")
+        self.assertEqual(reader.get_field("tokenizer.chat_template").contents(), "unmodified pre-patch")
+        del reader
+
+    def test_snapshot_surgery_interactive_eof_aborts_cleanly(self):
+        """PASS: Closed stdin during Snapshot Surgery confirmation aborts cleanly with exit code 1 and leaves file unmodified; FAIL: Hangs or returns 0."""
+        commit = "e" * 40
+        self.create_synthetic_hf_repo("testorg/consent-eof", [{"commit_hash": commit, "files": {}}])
+        snap_dir = self.hf_cache_dir / "models--testorg--consent-eof" / "snapshots" / commit
+        self.create_synthetic_gguf("model.gguf", template="unmodified pre-patch", target_dir=snap_dir)
+
+        res = self.run_script(
+            "testorg/consent-eof",
+            input="",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res.returncode, 1, msg=f"Expected exit code 1, got {res.returncode}")
+        self.assertIn("Snapshot Surgery", res.stderr)
+        self.assertIn("HF_HUB_OFFLINE=1", res.stderr)
+        self.assertIn("Standard input was closed without confirmation. Use --force", res.stderr)
+
+        reader = gguf.GGUFReader(snap_dir / "model.gguf", "r")
+        self.assertEqual(reader.get_field("tokenizer.chat_template").contents(), "unmodified pre-patch")
+        del reader
+
+    def test_snapshot_surgery_direct_cache_path(self):
+        """PASS: Specifying a direct filesystem path to a cached GGUF file invokes Snapshot Surgery warning and consent; FAIL: Skips warning or prompt."""
+        commit = "f" * 40
+        self.create_synthetic_hf_repo("testorg/direct-path", [{"commit_hash": commit, "files": {}}])
+        snap_dir = self.hf_cache_dir / "models--testorg--direct-path" / "snapshots" / commit
+        gguf_path, _ = self.create_synthetic_gguf("model.gguf", target_dir=snap_dir)
+
+        # 1. Decline
+        res_no = self.run_script(
+            str(gguf_path),
+            input="NO\n",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res_no.returncode, 1)
+        self.assertIn("Snapshot Surgery", res_no.stderr)
+        self.assertIn("HF_HUB_OFFLINE=1", res_no.stderr)
+
+        # 2. Confirm
+        res_yes = self.run_script(
+            str(gguf_path),
+            input="YES\n",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res_yes.returncode, 0)
+        self.assertIn("Snapshot Surgery", res_yes.stderr)
+        self.assertIn("HF_HUB_OFFLINE=1", res_yes.stderr)
+        self.assertTrue(install.verify_gguf(gguf_path, SOURCE_TEMPLATE))
 
 
 if __name__ == "__main__":
