@@ -29,3 +29,5 @@ http-client.private.env.json
 /.swival/
 /.junie/
 /.logs/
+/.claude/
+/.codex/
