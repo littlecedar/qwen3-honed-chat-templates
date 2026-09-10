@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import re
 import shutil
 import struct
@@ -34,6 +35,9 @@ from typing import Any, Sequence
 
 import gguf
 from gguf import GGUFValueType, Keys
+from huggingface_hub import scan_cache_dir
+from huggingface_hub.errors import CacheNotFound, HFValidationError
+from huggingface_hub.utils import validate_repo_id
 from jinja2 import Environment
 
 from scripts.minify_jinja import minify_jinja
@@ -81,6 +85,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Revert model directory or GGUF file back to its original chat template using backup data",
     )
+    parser.add_argument(
+        "--latest",
+        action="store_true",
+        help="Automatically select the most recently updated snapshot when resolving a Hugging Face model repository with multiple cached revisions",
+    )
     return parser.parse_args(argv)
 
 
@@ -96,6 +105,143 @@ def is_gguf_file(path: Path) -> bool:
             return header == b"GGUF"
     except Exception:
         return False
+
+
+def is_hf_repo_id(identifier: str) -> bool:
+    """Validate whether an identifier matches Hugging Face repository ID format."""
+    if not isinstance(identifier, str) or not identifier.strip():
+        return False
+    try:
+        validate_repo_id(identifier)
+        return True
+    except (HFValidationError, ValueError):
+        return False
+    except Exception:
+        return False
+
+
+def find_cached_repo(
+    repo_id: str,
+    cache_dir: Path | str | None = None,
+) -> Any | None:
+    """Scan local Hugging Face cache and find repository info matching repo_id."""
+    if not is_hf_repo_id(repo_id):
+        return None
+
+    if cache_dir is None:
+        cache_dir = os.environ.get("HF_HUB_CACHE")
+
+    try:
+        cache_info = scan_cache_dir(cache_dir=cache_dir)
+    except (CacheNotFound, FileNotFoundError):
+        return None
+    except Exception:
+        return None
+
+    for repo in cache_info.repos:
+        if getattr(repo, "repo_type", None) == "model" and repo.repo_id == repo_id:
+            return repo
+    for repo in cache_info.repos:
+        if repo.repo_id == repo_id:
+            return repo
+    for repo in cache_info.repos:
+        if getattr(repo, "repo_type", None) == "model" and repo.repo_id.lower() == repo_id.lower():
+            return repo
+    for repo in cache_info.repos:
+        if repo.repo_id.lower() == repo_id.lower():
+            return repo
+    return None
+
+
+def resolve_hf_model_path(
+    repo_id: str,
+    latest: bool = False,
+    cache_dir: Path | str | None = None,
+) -> Path | None:
+    """Scan the Hugging Face cache for repo_id and resolve the chosen revision snapshot path.
+
+    If multiple revisions exist, prompts the user unless latest=True.
+    Returns None if the repository or snapshots are not found in cache.
+    """
+    if not is_hf_repo_id(repo_id):
+        return None
+
+    target_repo = find_cached_repo(repo_id, cache_dir=cache_dir)
+    if target_repo is None or not getattr(target_repo, "revisions", None):
+        return None
+
+    revisions = [
+        rev
+        for rev in target_repo.revisions
+        if getattr(rev, "snapshot_path", None) is not None and Path(rev.snapshot_path).is_dir()
+    ]
+    if not revisions:
+        return None
+
+    revisions.sort(key=lambda r: getattr(r, "last_modified", 0.0), reverse=True)
+
+    if len(revisions) == 1 or latest:
+        return Path(revisions[0].snapshot_path).resolve()
+
+    print(f"Multiple revisions found in Hugging Face cache for '{repo_id}':")
+    for i, rev in enumerate(revisions, 1):
+        commit_short = rev.commit_hash[:10] if len(rev.commit_hash) >= 10 else rev.commit_hash
+        refs_str = f" (refs: {', '.join(sorted(rev.refs))})" if getattr(rev, "refs", None) else ""
+        print(
+            f"  [{i}] Commit: {commit_short}{refs_str} | "
+            f"Modified: {getattr(rev, 'last_modified_str', '')} | "
+            f"Size: {getattr(rev, 'size_on_disk_str', '')} | "
+            f"Files: {getattr(rev, 'nb_files', len(getattr(rev, 'files', [])))}"
+        )
+
+    prompt = f"Select revision [1-{len(revisions)}] (default: 1): "
+    while True:
+        try:
+            choice = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted by user.", file=sys.stderr)
+            sys.exit(1)
+
+        if not choice:
+            return Path(revisions[0].snapshot_path).resolve()
+
+        if choice.isdigit():
+            idx = int(choice)
+            if 1 <= idx <= len(revisions):
+                return Path(revisions[idx - 1].snapshot_path).resolve()
+
+        matches = [
+            r
+            for r in revisions
+            if r.commit_hash.lower().startswith(choice.lower())
+        ]
+        if len(matches) == 1:
+            return Path(matches[0].snapshot_path).resolve()
+        elif len(matches) > 1:
+            print(
+                f"Error: Ambiguous revision prefix '{choice}'. Matches multiple revisions.",
+                file=sys.stderr,
+            )
+            continue
+
+        ref_matches = [
+            r
+            for r in revisions
+            if choice in getattr(r, "refs", ())
+        ]
+        if len(ref_matches) == 1:
+            return Path(ref_matches[0].snapshot_path).resolve()
+        elif len(ref_matches) > 1:
+            print(
+                f"Error: Ambiguous reference '{choice}'. Matches multiple revisions.",
+                file=sys.stderr,
+            )
+            continue
+
+        print(
+            f"Error: Invalid selection '{choice}'. Please enter a number [1-{len(revisions)}] or commit hash prefix.",
+            file=sys.stderr,
+        )
 
 
 def backup_file(path: Path) -> Path:
@@ -873,11 +1019,28 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         if not target_path.exists():
-            print(
-                f"Error: Target path does not exist: '{args.model_path}'",
-                file=sys.stderr,
-            )
-            return 1
+            if is_hf_repo_id(args.model_path) and not args.model_path.lower().endswith(".gguf"):
+                target_repo = find_cached_repo(args.model_path)
+                if target_repo is None:
+                    print(
+                        f"Error: Hugging Face model repository '{args.model_path}' not found in local cache.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                resolved_path = resolve_hf_model_path(args.model_path, latest=args.latest)
+                if resolved_path is None:
+                    print(
+                        f"Error: No valid snapshot directory found in cache for Hugging Face repository '{args.model_path}'.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                target_path = resolved_path
+            else:
+                print(
+                    f"Error: Target path does not exist: '{args.model_path}'",
+                    file=sys.stderr,
+                )
+                return 1
 
         if target_path.is_dir():
             if args.uninstall:

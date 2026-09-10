@@ -4,11 +4,13 @@
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import gguf
 import numpy as np
@@ -79,13 +81,23 @@ class TestApplyChatTemplate(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.test_dir = Path(self.temp_dir.name)
+        self.hf_cache_dir = self.test_dir / "hf_cache"
+        self.hf_cache_dir.mkdir(parents=True, exist_ok=True)
 
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def run_script(self, *args, input: str | None = None):
+    def run_script(
+        self,
+        *args,
+        input: str | None = None,
+        env: dict[str, str] | None = None,
+    ):
         cmd = [sys.executable, str(APPLY_SCRIPT)] + list(args)
-        return subprocess.run(cmd, input=input, capture_output=True, text=True)
+        proc_env = os.environ.copy()
+        if env:
+            proc_env.update(env)
+        return subprocess.run(cmd, input=input, capture_output=True, text=True, env=proc_env)
 
     def assert_subprocess_failure(
         self,
@@ -135,6 +147,46 @@ class TestApplyChatTemplate(unittest.TestCase):
         writer.close()
         return path, arr
 
+    def create_synthetic_hf_repo(
+        self,
+        repo_id: str,
+        revisions: list[dict],
+        cache_dir: Path | None = None,
+    ) -> Path:
+        """Create a synthetic Hugging Face cache directory structure for a model repository."""
+        if cache_dir is None:
+            cache_dir = self.hf_cache_dir
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        repo_folder = "models--" + repo_id.replace("/", "--")
+        repo_dir = cache_dir / repo_folder
+        repo_dir.mkdir(parents=True, exist_ok=True)
+
+        for rev in revisions:
+            commit_hash = rev["commit_hash"]
+            snap_dir = repo_dir / "snapshots" / commit_hash
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            files = rev.get(
+                "files",
+                {"tokenizer_config.json": json.dumps({"chat_template": "old_template_content"})},
+            )
+            mtime = rev.get("last_modified", 1000.0)
+            for fname, fcontent in files.items():
+                fpath = snap_dir / fname
+                fpath.parent.mkdir(parents=True, exist_ok=True)
+                fpath.write_text(fcontent, encoding="utf-8")
+                os.utime(fpath, (mtime, mtime))
+            os.utime(snap_dir, (mtime, mtime))
+
+            refs = rev.get("refs", [])
+            if refs:
+                refs_dir = repo_dir / "refs"
+                refs_dir.mkdir(parents=True, exist_ok=True)
+                for ref_name in refs:
+                    ref_file = refs_dir / ref_name
+                    ref_file.write_text(commit_hash, encoding="utf-8")
+
+        return repo_dir
+
     def test_cli_help(self):
         """PASS: CLI prints usage documentation when invoked with --help; FAIL: Non-zero exit code or missing required flags."""
         res = self.run_script("--help")
@@ -157,6 +209,11 @@ class TestApplyChatTemplate(unittest.TestCase):
             "--uninstall",
             res.stdout,
             msg="CLI --help output does not describe the '--uninstall' flag.",
+        )
+        self.assertIn(
+            "--latest",
+            res.stdout,
+            msg="CLI --help output does not describe the '--latest' flag.",
         )
 
     def test_missing_model_path_argument(self):
@@ -847,6 +904,355 @@ class TestApplyChatTemplate(unittest.TestCase):
             install.verify_gguf,
             dummy_file,
             description="verify_gguf fails cleanly when gguf module is unavailable",
+        )
+
+    def test_is_hf_repo_id(self):
+        """PASS: Correctly classifies valid Hugging Face repo IDs and rejects invalid ones; FAIL: False positive/negative identification."""
+        self.assertTrue(install.is_hf_repo_id("froggeric/Qwen-Fixed-Chat-Templates"))
+        self.assertTrue(install.is_hf_repo_id("testorg/testmodel"))
+        self.assertTrue(install.is_hf_repo_id("bert-base-uncased"))
+        self.assertTrue(install.is_hf_repo_id("Qwen/Qwen2.5-7B-Instruct"))
+        self.assertTrue(install.is_hf_repo_id("org.sub/model-1_2"))
+
+        self.assertFalse(install.is_hf_repo_id(""))
+        self.assertFalse(install.is_hf_repo_id("   "))
+        self.assertFalse(install.is_hf_repo_id("/testorg/testmodel"))
+        self.assertFalse(install.is_hf_repo_id("testorg//testmodel"))
+        self.assertFalse(install.is_hf_repo_id("testorg/testmodel/sub"))
+        self.assertFalse(install.is_hf_repo_id(None))
+        self.assertFalse(install.is_hf_repo_id(12345))
+
+    def test_resolve_hf_model_path_unit(self):
+        """PASS: resolve_hf_model_path resolves single/latest revisions and returns None for invalid or missing repos; FAIL: Resolves incorrectly."""
+        # Non-HF identifier returns None
+        self.assertIsNone(install.resolve_hf_model_path("not/a/valid/repo/path"))
+
+        # Repo not in cache returns None
+        self.assertIsNone(install.resolve_hf_model_path("missing/repo", cache_dir=self.hf_cache_dir))
+
+        # Single revision returns Path
+        commit = "1" * 40
+        self.create_synthetic_hf_repo("testorg/single", [{"commit_hash": commit}])
+        resolved = install.resolve_hf_model_path("testorg/single", cache_dir=self.hf_cache_dir)
+        self.assertIsNotNone(resolved)
+        self.assertTrue(resolved.is_dir())
+        self.assertIn(commit, str(resolved))
+
+        # Multi revisions with latest=True returns newest
+        c_old = "a" * 40
+        c_new = "b" * 40
+        self.create_synthetic_hf_repo(
+            "testorg/multi",
+            [
+                {"commit_hash": c_old, "last_modified": 100.0},
+                {"commit_hash": c_new, "last_modified": 200.0},
+            ],
+        )
+        resolved_latest = install.resolve_hf_model_path("testorg/multi", latest=True, cache_dir=self.hf_cache_dir)
+        self.assertIsNotNone(resolved_latest)
+        self.assertIn(c_new, str(resolved_latest))
+
+    def test_resolve_hf_model_path_keyboard_interrupt_aborts(self):
+        """PASS: resolve_hf_model_path exits with code 1 upon KeyboardInterrupt during interactive selection; FAIL: Uncaught exception or wrong exit code."""
+        c1 = "1" * 40
+        c2 = "2" * 40
+        self.create_synthetic_hf_repo(
+            "testorg/multi-kb",
+            [
+                {"commit_hash": c1, "last_modified": 100.0},
+                {"commit_hash": c2, "last_modified": 200.0},
+            ],
+        )
+        with mock.patch("builtins.input", side_effect=KeyboardInterrupt):
+            with assert_expected_failure("resolve_hf_model_path aborts cleanly on KeyboardInterrupt", expected_stderr_pattern="Aborted by user"):
+                with self.assertRaises(SystemExit) as cm:
+                    install.resolve_hf_model_path("testorg/multi-kb", latest=False, cache_dir=self.hf_cache_dir)
+                self.assertEqual(cm.exception.code, 1)
+
+    def test_resolve_hf_model_path_eof_aborts(self):
+        """PASS: resolve_hf_model_path exits with code 1 upon EOFError during interactive selection; FAIL: Uncaught exception or wrong exit code."""
+        c1 = "1" * 40
+        c2 = "2" * 40
+        self.create_synthetic_hf_repo(
+            "testorg/multi-eof",
+            [
+                {"commit_hash": c1, "last_modified": 100.0},
+                {"commit_hash": c2, "last_modified": 200.0},
+            ],
+        )
+        with mock.patch("builtins.input", side_effect=EOFError):
+            with assert_expected_failure("resolve_hf_model_path aborts cleanly on EOFError", expected_stderr_pattern="Aborted by user"):
+                with self.assertRaises(SystemExit) as cm:
+                    install.resolve_hf_model_path("testorg/multi-eof", latest=False, cache_dir=self.hf_cache_dir)
+                self.assertEqual(cm.exception.code, 1)
+
+    def test_hf_resolve_single_revision_auto_selection(self):
+        """PASS: CLI auto-resolves single-revision model without prompt and applies template; FAIL: Prompts or fails to patch."""
+        commit = "c" * 40
+        self.create_synthetic_hf_repo("testorg/single-cli", [{"commit_hash": commit}])
+        res = self.run_script("testorg/single-cli", env={"HF_HUB_CACHE": str(self.hf_cache_dir)})
+        self.assertEqual(res.returncode, 0, msg=f"Script failed: {res.stderr}")
+        self.assertIn("Successfully applied chat template to directory.", res.stdout)
+        self.assertNotIn("Select revision", res.stdout)
+
+        snap_dir = self.hf_cache_dir / "models--testorg--single-cli" / "snapshots" / commit
+        self.assertTrue((snap_dir / "chat_template.jinja").is_file())
+        config_data = json.loads((snap_dir / "tokenizer_config.json").read_text(encoding="utf-8"))
+        self.assertIn("Never: open with preamble", config_data["chat_template"])
+
+    def test_hf_resolve_multiple_revisions_with_latest_flag(self):
+        """PASS: CLI with --latest flag automatically patches newest revision; FAIL: Prompts or patches wrong revision."""
+        c_old = "1" * 40
+        c_new = "2" * 40
+        self.create_synthetic_hf_repo(
+            "testorg/multi-latest-cli",
+            [
+                {"commit_hash": c_old, "last_modified": 1000.0, "refs": ["v1.0"]},
+                {"commit_hash": c_new, "last_modified": 2000.0, "refs": ["main"]},
+            ],
+        )
+        res = self.run_script(
+            "testorg/multi-latest-cli",
+            "--latest",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res.returncode, 0, msg=f"Script failed: {res.stderr}")
+        self.assertIn("Successfully applied chat template to directory.", res.stdout)
+        self.assertNotIn("Select revision", res.stdout)
+
+        repo_dir = self.hf_cache_dir / "models--testorg--multi-latest-cli" / "snapshots"
+        snap_new = repo_dir / c_new
+        snap_old = repo_dir / c_old
+
+        # Newest revision is patched
+        self.assertTrue((snap_new / "chat_template.jinja").is_file())
+        new_config = json.loads((snap_new / "tokenizer_config.json").read_text(encoding="utf-8"))
+        self.assertIn("Never: open with preamble", new_config["chat_template"])
+
+        # Older revision remains untouched
+        self.assertFalse((snap_old / "chat_template.jinja").is_file())
+        old_config = json.loads((snap_old / "tokenizer_config.json").read_text(encoding="utf-8"))
+        self.assertEqual(old_config["chat_template"], "old_template_content")
+
+    def test_hf_resolve_multiple_revisions_interactive_by_index(self):
+        """PASS: Interactive prompt accepts index selection and patches chosen revision; FAIL: Prompts fail or wrong revision patched."""
+        c_old = "1" * 40
+        c_new = "2" * 40
+        self.create_synthetic_hf_repo(
+            "testorg/multi-interactive-cli",
+            [
+                {"commit_hash": c_old, "last_modified": 1000.0},
+                {"commit_hash": c_new, "last_modified": 2000.0},
+            ],
+        )
+        # In chronological descending order: [1] is c_new, [2] is c_old.
+        # Select index '2' to patch the older revision.
+        res = self.run_script(
+            "testorg/multi-interactive-cli",
+            input="2\n",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res.returncode, 0, msg=f"Script failed: {res.stderr}")
+        self.assertIn("Select revision", res.stdout)
+        self.assertIn("Successfully applied chat template to directory.", res.stdout)
+
+        repo_dir = self.hf_cache_dir / "models--testorg--multi-interactive-cli" / "snapshots"
+        snap_old = repo_dir / c_old
+        snap_new = repo_dir / c_new
+
+        # Selected revision 2 (c_old) is patched
+        self.assertTrue((snap_old / "chat_template.jinja").is_file())
+        old_config = json.loads((snap_old / "tokenizer_config.json").read_text(encoding="utf-8"))
+        self.assertIn("Never: open with preamble", old_config["chat_template"])
+
+        # Revision 1 (c_new) remains untouched
+        self.assertFalse((snap_new / "chat_template.jinja").is_file())
+
+    def test_hf_resolve_multiple_revisions_interactive_by_commit_hash(self):
+        """PASS: Interactive prompt accepts commit hash prefix and patches matched revision; FAIL: Commit hash prefix rejected."""
+        c1 = "a" * 40
+        c2 = "b" * 40
+        self.create_synthetic_hf_repo(
+            "testorg/multi-commit-prefix",
+            [
+                {"commit_hash": c1, "last_modified": 1000.0},
+                {"commit_hash": c2, "last_modified": 2000.0},
+            ],
+        )
+        res = self.run_script(
+            "testorg/multi-commit-prefix",
+            input=f"{c1[:8]}\n",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res.returncode, 0, msg=f"Script failed: {res.stderr}")
+        self.assertIn("Successfully applied chat template to directory.", res.stdout)
+
+        snap_c1 = self.hf_cache_dir / "models--testorg--multi-commit-prefix" / "snapshots" / c1
+        self.assertTrue((snap_c1 / "chat_template.jinja").is_file())
+
+    def test_hf_resolve_multiple_revisions_interactive_by_ref(self):
+        """PASS: Interactive prompt accepts ref name and patches matched revision; FAIL: Ref name rejected."""
+        c1 = "1" * 40
+        c2 = "2" * 40
+        self.create_synthetic_hf_repo(
+            "testorg/multi-ref",
+            [
+                {"commit_hash": c1, "last_modified": 1000.0, "refs": ["v1.0"]},
+                {"commit_hash": c2, "last_modified": 2000.0, "refs": ["main"]},
+            ],
+        )
+        res = self.run_script(
+            "testorg/multi-ref",
+            input="v1.0\n",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res.returncode, 0, msg=f"Script failed: {res.stderr}")
+        self.assertIn("Successfully applied chat template to directory.", res.stdout)
+
+        snap_c1 = self.hf_cache_dir / "models--testorg--multi-ref" / "snapshots" / c1
+        self.assertTrue((snap_c1 / "chat_template.jinja").is_file())
+
+    def test_hf_resolve_multiple_revisions_interactive_default_selection(self):
+        """PASS: Interactive prompt defaults to newest revision when user presses Enter; FAIL: Fails to use default revision."""
+        c_old = "1" * 40
+        c_new = "2" * 40
+        self.create_synthetic_hf_repo(
+            "testorg/multi-default",
+            [
+                {"commit_hash": c_old, "last_modified": 1000.0},
+                {"commit_hash": c_new, "last_modified": 2000.0},
+            ],
+        )
+        res = self.run_script(
+            "testorg/multi-default",
+            input="\n",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res.returncode, 0, msg=f"Script failed: {res.stderr}")
+        self.assertIn("Successfully applied chat template to directory.", res.stdout)
+
+        snap_new = self.hf_cache_dir / "models--testorg--multi-default" / "snapshots" / c_new
+        self.assertTrue((snap_new / "chat_template.jinja").is_file())
+
+    def test_hf_resolve_multiple_revisions_interactive_retry_invalid_input(self):
+        """PASS: Interactive prompt reprompts on invalid selection and succeeds on subsequent valid entry; FAIL: Aborts on invalid input."""
+        c1 = "1" * 40
+        c2 = "2" * 40
+        self.create_synthetic_hf_repo(
+            "testorg/multi-retry",
+            [
+                {"commit_hash": c1, "last_modified": 1000.0},
+                {"commit_hash": c2, "last_modified": 2000.0},
+            ],
+        )
+        res = self.run_script(
+            "testorg/multi-retry",
+            input="99\n1\n",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res.returncode, 0, msg=f"Script failed: {res.stderr}")
+        self.assertIn("Invalid selection '99'", res.stderr)
+        self.assertIn("Successfully applied chat template to directory.", res.stdout)
+
+    def test_hf_resolve_multiple_revisions_eof_aborts_cleanly(self):
+        """PASS: Closed standard input during interactive selection exits with code 1; FAIL: Crashes or exits with 0."""
+        c1 = "1" * 40
+        c2 = "2" * 40
+        self.create_synthetic_hf_repo(
+            "testorg/multi-eof-cli",
+            [
+                {"commit_hash": c1, "last_modified": 1000.0},
+                {"commit_hash": c2, "last_modified": 2000.0},
+            ],
+        )
+        res = self.run_script(
+            "testorg/multi-eof-cli",
+            input="",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assert_subprocess_failure(
+            res,
+            description="Interactive selection EOF",
+            expected_stderr="Aborted by user.",
+            expected_exit_code=1,
+        )
+
+    def test_hf_repo_not_found_in_cache(self):
+        """PASS: Non-existent HF repo ID reports descriptive error to stderr and exits with code 1; FAIL: Misleading error or 0 exit code."""
+        res = self.run_script(
+            "nonexistent-org/nonexistent-model",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assert_subprocess_failure(
+            res,
+            description="HF repo not in cache",
+            expected_stderr="Hugging Face model repository 'nonexistent-org/nonexistent-model' not found in local cache.",
+            expected_exit_code=1,
+        )
+
+    def test_hf_repo_no_valid_snapshots_in_cache(self):
+        """PASS: Cached HF repo with no valid snapshots reports descriptive error to stderr and exits with code 1; FAIL: Accepts empty repo."""
+        orig_find = install.find_cached_repo
+        orig_resolve = install.resolve_hf_model_path
+        self.addCleanup(setattr, install, "find_cached_repo", orig_find)
+        self.addCleanup(setattr, install, "resolve_hf_model_path", orig_resolve)
+        install.find_cached_repo = lambda *args, **kwargs: object()
+        install.resolve_hf_model_path = lambda *args, **kwargs: None
+
+        with assert_expected_failure(
+            "HF model repo with no snapshots in cache",
+            expected_stderr_pattern="No valid snapshot directory found in cache for Hugging Face repository",
+        ):
+            code = install.main(["testorg/empty-snapshots"])
+            self.assertEqual(code, 1)
+
+    def test_hf_model_uninstall_success(self):
+        """PASS: --uninstall with HF model repo ID restores original snapshot files and removes backups; FAIL: Fails to restore snapshot."""
+        commit = "u" * 40
+        self.create_synthetic_hf_repo("testorg/uninstall-hf", [{"commit_hash": commit}])
+
+        # 1. Apply patch
+        res_apply = self.run_script(
+            "testorg/uninstall-hf",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res_apply.returncode, 0, msg=f"Apply failed: {res_apply.stderr}")
+
+        snap_dir = self.hf_cache_dir / "models--testorg--uninstall-hf" / "snapshots" / commit
+        self.assertTrue((snap_dir / "chat_template.jinja").is_file())
+        self.assertTrue((snap_dir / "tokenizer_config.json.bak").is_file())
+
+        # 2. Uninstall
+        res_uninst = self.run_script(
+            "testorg/uninstall-hf",
+            "--uninstall",
+            env={"HF_HUB_CACHE": str(self.hf_cache_dir)},
+        )
+        self.assertEqual(res_uninst.returncode, 0, msg=f"Uninstall failed: {res_uninst.stderr}")
+        self.assertIn("Successfully uninstalled chat template from directory.", res_uninst.stdout)
+
+        # 3. Verify clean uninstallation
+        self.assertFalse((snap_dir / "chat_template.jinja").is_file())
+        self.assertFalse((snap_dir / "tokenizer_config.json.bak").is_file())
+        restored_config = json.loads((snap_dir / "tokenizer_config.json").read_text(encoding="utf-8"))
+        self.assertEqual(restored_config["chat_template"], "old_template_content")
+
+    def test_regression_non_hf_missing_path_message(self):
+        """PASS: Non-HF missing paths preserve exact backwards-compatible 'does not exist' error; FAIL: Phrasing altered."""
+        res_dir = self.run_script("./non_existent_relative_dir")
+        self.assert_subprocess_failure(
+            res_dir,
+            description="Non-HF relative path does not exist",
+            expected_stderr="Error: Target path does not exist: './non_existent_relative_dir'",
+            expected_exit_code=1,
+        )
+
+        res_gguf = self.run_script("missing_model.gguf")
+        self.assert_subprocess_failure(
+            res_gguf,
+            description="Missing .gguf file does not exist",
+            expected_stderr="Error: Target path does not exist: 'missing_model.gguf'",
+            expected_exit_code=1,
         )
 
 

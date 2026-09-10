@@ -10,7 +10,26 @@ The install script updates the chat templates for Qwen 3.x models in both Huggin
 git clone https://forgejo.littlecedar.net/travis/qwen3-honed-chat-templates.git
 cd qwen3-honed-chat-templates
 uv sync
-uv run install.py <model_directory_or_gguf_file>
+```
+
+## Run for GGUF Models
+
+```bash
+uv run install.py example-model.gguf
+```
+Or to force confirmation of the GGUF edit:
+```bash
+uv run install.py --force example-model.gguf
+```
+
+## Run for Hugging Face Models
+
+```bash
+uv run install.py example/model
+```
+Or to automatically select the most recent model revision:
+```bash
+uv run install.py --latest example/model
 ```
 
 # Uninstallation
