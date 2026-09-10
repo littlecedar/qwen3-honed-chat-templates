@@ -4,7 +4,14 @@ Honed chat templates for Qwen 3.x models.
 
 # Installation
 
-<!-- Add installation instructions here -->
+The install script updates the chat templates for Qwen 3.x models in both Hugging Face and GGUF format.
+
+> [!WARNING]
+> 
+> The install script will overwrite existing chat templates. Ensure you have a backup of your chat templates before running the script.
+
+1. Ensure your model is on accessible storage.
+2. Run `python3 install.py <model_directory_or_gguf_file>`.
 
 # References
 
@@ -26,5 +33,5 @@ Honed chat templates for Qwen 3.x models.
 ```
 
 <!-- Links -->
-[froggeric/Qwen-Fixed-Chat-Templates]: https://github.com/froggeric/Qwen-Fixed-Chat-Templates
-[peculiar-ragdoll/Qwen-Sharp-Chat-Templates]: https://github.com/peculiar-ragdoll/Qwen-Sharp-Chat-Templates
+[froggeric/Qwen-Fixed-Chat-Templates]: https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates
+[peculiar-ragdoll/Qwen-Sharp-Chat-Templates]: https://huggingface.co/peculiar-ragdoll/Qwen-Sharp-Chat-Templates
