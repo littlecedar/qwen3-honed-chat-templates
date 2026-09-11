@@ -49,6 +49,7 @@ if str(REPO_ROOT) not in sys.path:
 
 SOURCE_TEMPLATE_NAME = "chat_template.jinja"
 SOURCE_TEMPLATE_PATH = REPO_ROOT / SOURCE_TEMPLATE_NAME
+DIST_SUFFIX = ".dist"
 
 # ANSI colors for diagnostics
 GREEN = "\033[92m"
@@ -85,6 +86,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--uninstall",
         action="store_true",
         help="Revert model directory or GGUF file back to its original chat template using backup data",
+    )
+    parser.add_argument(
+        "--target-version",
+        type=str,
+        default=None,
+        help="Specific backup version to downgrade to during uninstallation",
     )
     parser.add_argument(
         "--latest",
@@ -503,11 +510,122 @@ def handle_snapshot_surgery(target_path: Path, force: bool = False) -> bool:
     return confirm_snapshot_surgery(force=force)
 
 
+def ensure_dist_backup(path: Path) -> Path:
+    """Create a .dist baseline copy of a file if one does not already exist."""
+    dist_path = path.with_name(f"{path.name}{DIST_SUFFIX}")
+    if not dist_path.is_file() and path.is_file():
+        shutil.copy2(path, dist_path)
+    return dist_path
+
+
+def create_versioned_backup(path: Path, version: str) -> Path:
+    """Create a <path>.<version>.bak versioned backup copy of a file and maintain <path>.bak."""
+    safe_version = re.sub(r"[^a-zA-Z0-9_.-]+", "_", version).strip("_")
+    if not safe_version:
+        safe_version = "unknown"
+    versioned_bak = path.with_name(f"{path.name}.{safe_version}.bak")
+    standard_bak = path.with_name(f"{path.name}.bak")
+    shutil.copy2(path, versioned_bak)
+    shutil.copy2(path, standard_bak)
+    return versioned_bak
+
+
 def backup_file(path: Path) -> Path:
     """Create a .bak backup copy of a file."""
     bak_path = path.with_name(f"{path.name}.bak")
     shutil.copy2(path, bak_path)
     return bak_path
+
+
+def get_directory_backup_versions(target_dir: Path | str) -> list[tuple[str, Path, Path | None]]:
+    """Discover all available versioned backups and the .dist baseline in a model directory.
+
+    Returns a list of tuples: (version, config_backup_path, jinja_backup_path_or_None).
+    """
+    target_dir = Path(target_dir)
+    if not target_dir.is_dir():
+        return []
+
+    results: list[tuple[str, Path, Path | None]] = []
+    versioned_map: dict[str, tuple[Path, Path | None]] = {}
+
+    pattern = re.compile(r"^tokenizer_config\.json\.(.+)\.bak$")
+    for item in target_dir.iterdir():
+        if not item.is_file():
+            continue
+        m = pattern.match(item.name)
+        if m:
+            ver = m.group(1)
+            jinja_bak = target_dir / f"{SOURCE_TEMPLATE_NAME}.{ver}.bak"
+            versioned_map[ver] = (item, jinja_bak if jinja_bak.is_file() else None)
+
+    for ver in sorted(versioned_map.keys()):
+        cfg, jin = versioned_map[ver]
+        results.append((ver, cfg, jin))
+
+    # Check for .dist baseline (or fallback to legacy .bak)
+    dist_config = target_dir / f"tokenizer_config.json{DIST_SUFFIX}"
+    dist_jinja = target_dir / f"{SOURCE_TEMPLATE_NAME}{DIST_SUFFIX}"
+    bak_config = target_dir / "tokenizer_config.json.bak"
+    bak_jinja = target_dir / f"{SOURCE_TEMPLATE_NAME}.bak"
+
+    if dist_config.is_file():
+        results.append(("dist", dist_config, dist_jinja if dist_jinja.is_file() else None))
+    elif bak_config.is_file():
+        results.append(("dist", bak_config, bak_jinja if bak_jinja.is_file() else None))
+
+    return results
+
+
+def prompt_downgrade_choice(versions: list[str]) -> str | None:
+    """Prompt the user with available rollback versions or complete .dist revert.
+
+    Returns the selected version string, 'dist' for full revert, or None if aborted.
+    """
+    downgrade_versions = [v for v in versions if v != "dist"]
+    menu_items: list[str] = list(downgrade_versions)
+    menu_items.append("dist")
+
+    if len(menu_items) == 1 and menu_items[0] == "dist":
+        return "dist"
+
+    print("\nAvailable uninstallation / rollback targets:")
+    for idx, ver in enumerate(menu_items, 1):
+        if ver == "dist":
+            print(f"  [{idx}] Completely revert to original template (.dist baseline)")
+        else:
+            print(f"  [{idx}] Downgrade to {ver}")
+
+    while True:
+        try:
+            prompt_str = f"Select an option (1-{len(menu_items)}) or 'q' to abort: "
+            choice_str = input(prompt_str).strip()
+        except EOFError:
+            print(
+                "\nStandard input closed. Defaulting to complete revert to .dist baseline.",
+                file=sys.stderr,
+            )
+            return "dist"
+        except KeyboardInterrupt:
+            print("\nAborted.", file=sys.stderr)
+            return None
+
+        if choice_str.lower() in ("q", "quit", "abort", "exit"):
+            print("Aborted by user.", file=sys.stderr)
+            return None
+
+        if choice_str.isdigit():
+            idx = int(choice_str)
+            if 1 <= idx <= len(menu_items):
+                return menu_items[idx - 1]
+
+        if choice_str in menu_items:
+            return choice_str
+
+        print(
+            f"Invalid selection: '{choice_str}'. Please enter a number between 1 and {len(menu_items)}, or 'q'.",
+            file=sys.stderr,
+        )
 
 
 def patch_directory(target_dir: Path, source_template_path: Path) -> None:
@@ -522,23 +640,11 @@ def patch_directory(target_dir: Path, source_template_path: Path) -> None:
 
     target_template_path = target_dir / SOURCE_TEMPLATE_NAME
 
-    # 1. Create backups of existing files
-    if target_template_path.is_file():
-        bak_template = backup_file(target_template_path)
-        print(f"Created backup: {bak_template}")
-
-    bak_config = backup_file(tokenizer_config_path)
-    print(f"Created backup: {bak_config}")
-
-    # 2. Copy source chat_template.jinja into the target directory
-    shutil.copy2(source_template_path, target_template_path)
-    print(f"Copied '{source_template_path.name}' to '{target_template_path}'")
-
-    # 3. Read the source template and minify
+    # Read the source template and minify
     template_content = source_template_path.read_text(encoding="utf-8")
     minified_template = minify_jinja(template_content)
 
-    # 4. Patch tokenizer_config.json
+    # Read existing tokenizer_config.json
     try:
         with open(tokenizer_config_path, "r", encoding="utf-8") as f:
             config_data = json.load(f)
@@ -549,6 +655,65 @@ def patch_directory(target_dir: Path, source_template_path: Path) -> None:
         )
         sys.exit(1)
 
+    # 1. Establish immutable .dist baseline backups or create versioned backups
+    config_dist_path = tokenizer_config_path.with_name(f"{tokenizer_config_path.name}{DIST_SUFFIX}")
+    is_initial_install = not config_dist_path.is_file()
+
+    if is_initial_install:
+        bak_config = tokenizer_config_path.with_name(f"{tokenizer_config_path.name}.bak")
+        bak_template = target_template_path.with_name(f"{target_template_path.name}.bak")
+        if bak_config.is_file():
+            # Legacy migration: backfill .dist from pre-existing .bak
+            shutil.copy2(bak_config, config_dist_path)
+            print(f"Created baseline from legacy backup: {config_dist_path}")
+            if bak_template.is_file():
+                dist_template = target_template_path.with_name(f"{target_template_path.name}{DIST_SUFFIX}")
+                shutil.copy2(bak_template, dist_template)
+                print(f"Created baseline from legacy backup: {dist_template}")
+            is_initial_install = False
+
+    if is_initial_install:
+        if target_template_path.is_file():
+            dist_template = ensure_dist_backup(target_template_path)
+            print(f"Created baseline: {dist_template}")
+            bak_template = backup_file(target_template_path)
+            print(f"Created backup: {bak_template}")
+        dist_config = ensure_dist_backup(tokenizer_config_path)
+        print(f"Created baseline: {dist_config}")
+        bak_config = backup_file(tokenizer_config_path)
+        print(f"Created backup: {bak_config}")
+    else:
+        # Baseline already established; never overwrite .dist files.
+        installed_jinja = target_template_path.read_text(encoding="utf-8") if target_template_path.is_file() else None
+        installed_config_template = config_data.get("chat_template")
+
+        templates_identical = (
+            target_template_path.is_file()
+            and installed_jinja == template_content
+            and installed_config_template == minified_template
+        )
+
+        if not templates_identical:
+            if installed_jinja:
+                installed_version = extract_template_version(installed_jinja)
+            elif isinstance(installed_config_template, str):
+                installed_version = extract_template_version(installed_config_template)
+            else:
+                installed_version = "Unknown"
+
+            if target_template_path.is_file():
+                ver_template = create_versioned_backup(target_template_path, installed_version)
+                print(f"Created versioned backup: {ver_template}")
+            ver_config = create_versioned_backup(tokenizer_config_path, installed_version)
+            print(f"Created versioned backup: {ver_config}")
+        else:
+            print("Chat template is already up to date; skipping redundant backup creation.")
+
+    # 2. Copy source chat_template.jinja into the target directory
+    shutil.copy2(source_template_path, target_template_path)
+    print(f"Copied '{source_template_path.name}' to '{target_template_path}'")
+
+    # 3. Patch tokenizer_config.json
     config_data["chat_template"] = minified_template
 
     try:
@@ -565,8 +730,16 @@ def patch_directory(target_dir: Path, source_template_path: Path) -> None:
     print(f"Updated 'chat_template' in '{tokenizer_config_path}'")
 
 
-def uninstall_directory(target_dir: Path | str) -> bool:
-    """Uninstall the chat template from the model directory and restore from backups."""
+def uninstall_directory(
+    target_dir: Path | str,
+    force: bool = False,
+    target_version: str | None = None,
+) -> bool:
+    """Uninstall the chat template from the model directory and restore from backups.
+
+    Supports interactive downgrade selection when multiple versions exist, or complete
+    revert to the .dist baseline.
+    """
     target_dir = Path(target_dir)
     if not target_dir.is_dir():
         print(
@@ -576,61 +749,142 @@ def uninstall_directory(target_dir: Path | str) -> bool:
         sys.exit(1)
 
     tokenizer_config_path = target_dir / "tokenizer_config.json"
-    bak_config = target_dir / "tokenizer_config.json.bak"
     target_template_path = target_dir / SOURCE_TEMPLATE_NAME
-    bak_template = target_dir / f"{SOURCE_TEMPLATE_NAME}.bak"
 
-    if not bak_config.is_file() and not bak_template.is_file():
+    backups = get_directory_backup_versions(target_dir)
+    if not backups:
         print(
             f"Error: No backup files found in model directory '{target_dir}'.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    if not bak_config.is_file():
-        print(
-            f"Error: Missing backup file '{bak_config.name}' in model directory '{target_dir}'.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    downgrade_versions = [v for v in backups if v[0] != "dist"]
+    dist_entry = next((v for v in backups if v[0] == "dist"), None)
 
-    # 1. Restore tokenizer_config.json from tokenizer_config.json.bak
-    try:
-        shutil.copy2(bak_config, tokenizer_config_path)
-        bak_config.unlink()
-        print(f"Restored '{tokenizer_config_path.name}' from backup and removed '{bak_config.name}'.")
-    except Exception as e:
-        print(
-            f"Error: Failed to restore '{tokenizer_config_path}' from backup: {e}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    if target_version is not None:
+        choice = target_version
+    elif force or not downgrade_versions:
+        choice = "dist"
+    else:
+        version_names = [v[0] for v in downgrade_versions]
+        if dist_entry is not None:
+            version_names.append("dist")
+        choice = prompt_downgrade_choice(version_names)
+        if choice is None:
+            return False
 
-    # 2. Restore chat_template.jinja from chat_template.jinja.bak if present,
-    # or remove chat_template.jinja if it was created during installation and no backup existed.
-    if bak_template.is_file():
-        try:
-            shutil.copy2(bak_template, target_template_path)
-            bak_template.unlink()
-            print(f"Restored '{target_template_path.name}' from backup and removed '{bak_template.name}'.")
-        except Exception as e:
+    if choice == "dist":
+        if dist_entry is None:
             print(
-                f"Error: Failed to restore '{target_template_path}' from backup: {e}",
+                f"Error: Baseline backup (.dist) not found in '{target_dir}'.",
                 file=sys.stderr,
             )
             sys.exit(1)
-    elif target_template_path.is_file():
+        dist_config, dist_jinja = dist_entry[1], dist_entry[2]
         try:
-            target_template_path.unlink()
-            print(f"Removed '{target_template_path.name}' (created during installation).")
+            shutil.copy2(dist_config, tokenizer_config_path)
+            print(f"Restored '{tokenizer_config_path.name}' from baseline backup.")
         except Exception as e:
             print(
-                f"Error: Failed to remove '{target_template_path}': {e}",
+                f"Error: Failed to restore '{tokenizer_config_path}' from baseline: {e}",
                 file=sys.stderr,
             )
             sys.exit(1)
 
-    return True
+        if dist_jinja is not None and dist_jinja.is_file():
+            try:
+                shutil.copy2(dist_jinja, target_template_path)
+                print(f"Restored '{target_template_path.name}' from baseline backup.")
+            except Exception as e:
+                print(
+                    f"Error: Failed to restore '{target_template_path}' from baseline: {e}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        elif target_template_path.is_file():
+            try:
+                target_template_path.unlink()
+                print(f"Removed '{target_template_path.name}' (created during installation).")
+            except Exception as e:
+                print(
+                    f"Error: Failed to remove '{target_template_path}': {e}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+        # Clean up all backup artifacts (.dist, .bak, and versioned backups)
+        artifacts_to_clean: list[Path] = [
+            target_dir / f"tokenizer_config.json{DIST_SUFFIX}",
+            target_dir / f"{SOURCE_TEMPLATE_NAME}{DIST_SUFFIX}",
+            target_dir / "tokenizer_config.json.bak",
+            target_dir / f"{SOURCE_TEMPLATE_NAME}.bak",
+        ]
+        for f in target_dir.iterdir():
+            if not f.is_file():
+                continue
+            if re.match(r"^tokenizer_config\.json\..+\.bak$", f.name) or re.match(
+                rf"^{re.escape(SOURCE_TEMPLATE_NAME)}\..+\.bak$", f.name
+            ):
+                artifacts_to_clean.append(f)
+
+        for art in artifacts_to_clean:
+            if art.is_file():
+                try:
+                    art.unlink()
+                except OSError:
+                    pass
+
+        return True
+
+    else:
+        # Downgrade to intermediate version
+        match = next((v for v in downgrade_versions if v[0] == choice), None)
+        if match is None:
+            print(
+                f"Error: Requested downgrade version '{choice}' not found in '{target_dir}'.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        ver, ver_config, ver_jinja = match
+        try:
+            shutil.copy2(ver_config, tokenizer_config_path)
+            ver_config.unlink()
+            print(f"Restored '{tokenizer_config_path.name}' from version '{choice}' backup.")
+        except Exception as e:
+            print(
+                f"Error: Failed to restore '{tokenizer_config_path}' from version '{choice}': {e}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if ver_jinja is not None and ver_jinja.is_file():
+            try:
+                shutil.copy2(ver_jinja, target_template_path)
+                ver_jinja.unlink()
+                print(f"Restored '{target_template_path.name}' from version '{choice}' backup.")
+            except Exception as e:
+                print(
+                    f"Error: Failed to restore '{target_template_path}' from version '{choice}': {e}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+        # Synchronize standard .bak files with next newest remaining backup or .dist
+        remaining = [v for v in get_directory_backup_versions(target_dir) if v[0] != "dist"]
+        if remaining:
+            newest_ver = remaining[-1]
+            shutil.copy2(newest_ver[1], target_dir / "tokenizer_config.json.bak")
+            if newest_ver[2] and newest_ver[2].is_file():
+                shutil.copy2(newest_ver[2], target_dir / f"{SOURCE_TEMPLATE_NAME}.bak")
+        elif dist_entry is not None:
+            shutil.copy2(dist_entry[1], target_dir / "tokenizer_config.json.bak")
+            if dist_entry[2] and dist_entry[2].is_file():
+                shutil.copy2(dist_entry[2], target_dir / f"{SOURCE_TEMPLATE_NAME}.bak")
+
+        print(f"Successfully downgraded chat template to version '{choice}'.")
+        return True
 
 
 def pack_kv_data(
@@ -832,6 +1086,46 @@ def extract_gguf_backup(target_path: Path | str) -> str | None:
     return extract_gguf_metadata(target_path, f"{Keys.Tokenizer.CHAT_TEMPLATE}.backup")
 
 
+def extract_gguf_dist(target_path: Path | str) -> str | None:
+    """Extract the original baseline chat template from tokenizer.chat_template.dist."""
+    return extract_gguf_metadata(target_path, f"{Keys.Tokenizer.CHAT_TEMPLATE}.dist")
+
+
+def get_gguf_backup_versions(target_path: Path | str) -> list[str]:
+    """Scan GGUF metadata for available backup version keys and .dist baseline."""
+    target_path = Path(target_path)
+    if not target_path.is_file():
+        return []
+    reader = None
+    versions: list[str] = []
+    has_dist = False
+    try:
+        reader = gguf.GGUFReader(target_path, "r")
+        prefix = f"{Keys.Tokenizer.CHAT_TEMPLATE}."
+        for k in reader.fields.keys():
+            if k == f"{Keys.Tokenizer.CHAT_TEMPLATE}.dist":
+                has_dist = True
+            elif k == f"{Keys.Tokenizer.CHAT_TEMPLATE}.backup":
+                pass
+            elif k.startswith(prefix) and k.endswith(".bak"):
+                ver = k[len(prefix) : -len(".bak")]
+                if ver and ver not in versions:
+                    versions.append(ver)
+        if not has_dist:
+            if f"{Keys.Tokenizer.CHAT_TEMPLATE}.backup" in reader.fields:
+                has_dist = True
+        versions.sort()
+        if has_dist:
+            versions.append("dist")
+    except Exception:
+        return []
+    finally:
+        if reader is not None:
+            del reader
+            gc.collect()
+    return versions
+
+
 def restore_gguf_backup(target_path: Path | str) -> bool:
     """Restore tokenizer.chat_template from tokenizer.chat_template.backup and remove the backup key."""
     target_path = Path(target_path)
@@ -880,6 +1174,7 @@ def patch_gguf(target_path: Path, minified_template: str, force: bool = False) -
     # 2. Validate the GGUF file can be parsed and inspect the existing template
     existing_template: str | None = None
     existing_backup: str | None = None
+    existing_dist: str | None = None
     reader = None
     try:
         reader = gguf.GGUFReader(target_path, "r")
@@ -897,6 +1192,13 @@ def patch_gguf(target_path: Path, minified_template: str, force: bool = False) -
                 existing_backup = bytes(bval).decode("utf-8")
             else:
                 existing_backup = str(bval)
+        dfield = reader.get_field(f"{Keys.Tokenizer.CHAT_TEMPLATE}.dist")
+        if dfield is not None:
+            dval = dfield.contents()
+            if isinstance(dval, (bytes, bytearray, memoryview)):
+                existing_dist = bytes(dval).decode("utf-8")
+            else:
+                existing_dist = str(dval)
     except Exception as e:
         print(f"Error: Failed to parse GGUF file '{target_path}': {e}", file=sys.stderr)
         sys.exit(1)
@@ -932,8 +1234,29 @@ def patch_gguf(target_path: Path, minified_template: str, force: bool = False) -
         updates: dict[str, Any] = {
             Keys.Tokenizer.CHAT_TEMPLATE: minified_template,
         }
-        if existing_backup is None and existing_template is not None:
-            updates[f"{Keys.Tokenizer.CHAT_TEMPLATE}.backup"] = existing_template
+
+        # 1. Establish immutable .dist baseline on initial patch
+        if existing_dist is None:
+            baseline_template = existing_backup if existing_backup is not None else existing_template
+            if baseline_template is not None:
+                updates[f"{Keys.Tokenizer.CHAT_TEMPLATE}.dist"] = baseline_template
+
+        # 2. Check if already patched before
+        is_already_patched = existing_dist is not None or existing_backup is not None
+
+        if not is_already_patched:
+            # Initial patch on pristine GGUF: store standard backup
+            if existing_template is not None:
+                updates[f"{Keys.Tokenizer.CHAT_TEMPLATE}.backup"] = existing_template
+        else:
+            # Already patched GGUF: check if payload template differs from installed
+            if existing_template is not None and existing_template != minified_template:
+                installed_version = extract_template_version(existing_template)
+                safe_version = re.sub(r"[^a-zA-Z0-9_.-]+", "_", installed_version).strip("_") or "unknown"
+                versioned_key = f"{Keys.Tokenizer.CHAT_TEMPLATE}.{safe_version}.bak"
+                updates[versioned_key] = existing_template
+                # Maintain standard .backup key pointing to previous version
+                updates[f"{Keys.Tokenizer.CHAT_TEMPLATE}.backup"] = existing_template
 
         success = gguf_set_metadata(target_path, updates)
         if not success:
@@ -947,7 +1270,11 @@ def patch_gguf(target_path: Path, minified_template: str, force: bool = False) -
         sys.exit(1)
 
 
-def uninstall_gguf(target_path: Path | str) -> bool:
+def uninstall_gguf(
+    target_path: Path | str,
+    force: bool = False,
+    target_version: str | None = None,
+) -> bool:
     """Uninstall the chat template from the GGUF file and restore from backup."""
     target_path = Path(target_path)
     if not target_path.is_file():
@@ -961,36 +1288,119 @@ def uninstall_gguf(target_path: Path | str) -> bool:
         )
         sys.exit(1)
 
-    backup_template = extract_gguf_backup(target_path)
-    if backup_template is None:
+    backup_versions = get_gguf_backup_versions(target_path)
+    if not backup_versions:
         print(
             f"Error: No backup chat template found in '{target_path}' (missing '{Keys.Tokenizer.CHAT_TEMPLATE}.backup').",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    try:
-        success = gguf_set_metadata(
-            target_path,
-            {Keys.Tokenizer.CHAT_TEMPLATE: backup_template},
-            removals=[f"{Keys.Tokenizer.CHAT_TEMPLATE}.backup"],
-        )
-        if not success:
-            print(f"Error: Failed to restore backup in GGUF file '{target_path}'.", file=sys.stderr)
-            sys.exit(1)
-        restored_template = extract_gguf_chat_template(target_path)
-        remaining_backup = extract_gguf_backup(target_path)
-        if restored_template != backup_template or remaining_backup is not None:
+    downgrade_versions = [v for v in backup_versions if v != "dist"]
+    has_dist = "dist" in backup_versions
+
+    if target_version is not None:
+        choice = target_version
+    elif force or not downgrade_versions:
+        choice = "dist"
+    else:
+        version_names = downgrade_versions + (["dist"] if has_dist else [])
+        choice = prompt_downgrade_choice(version_names)
+        if choice is None:
+            return False
+
+    if choice == "dist":
+        dist_template = extract_gguf_dist(target_path)
+        if dist_template is None:
+            dist_template = extract_gguf_backup(target_path)
+        if dist_template is None:
             print(
-                f"Error: GGUF uninstall verification failed for '{target_path}'.",
+                f"Error: Could not extract baseline template from '{target_path}'.",
                 file=sys.stderr,
             )
             sys.exit(1)
-        print(f"Restored '{Keys.Tokenizer.CHAT_TEMPLATE}' from backup and removed backup key in '{target_path}'")
-        return True
-    except Exception as e:
-        print(f"Error while restoring GGUF backup metadata: {e}", file=sys.stderr)
-        sys.exit(1)
+
+        removals = [
+            f"{Keys.Tokenizer.CHAT_TEMPLATE}.dist",
+            f"{Keys.Tokenizer.CHAT_TEMPLATE}.backup",
+        ]
+        for v in downgrade_versions:
+            removals.append(f"{Keys.Tokenizer.CHAT_TEMPLATE}.{v}.bak")
+
+        try:
+            success = gguf_set_metadata(
+                target_path,
+                {Keys.Tokenizer.CHAT_TEMPLATE: dist_template},
+                removals=removals,
+            )
+            if not success:
+                print(f"Error: Failed to restore backup in GGUF file '{target_path}'.", file=sys.stderr)
+                sys.exit(1)
+            restored_template = extract_gguf_chat_template(target_path)
+            remaining_backup = extract_gguf_backup(target_path)
+            remaining_dist = extract_gguf_dist(target_path)
+            if restored_template != dist_template or remaining_backup is not None or remaining_dist is not None:
+                print(
+                    f"Error: GGUF uninstall verification failed for '{target_path}'.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            print(f"Restored '{Keys.Tokenizer.CHAT_TEMPLATE}' from backup and removed backup key in '{target_path}'")
+            return True
+        except Exception as e:
+            print(f"Error while restoring GGUF backup metadata: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        if choice not in downgrade_versions:
+            print(
+                f"Error: Requested downgrade version '{choice}' not found in GGUF metadata.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        ver_key = f"{Keys.Tokenizer.CHAT_TEMPLATE}.{choice}.bak"
+        ver_template = extract_gguf_metadata(target_path, ver_key)
+        if ver_template is None:
+            print(
+                f"Error: Could not read template for version '{choice}' from '{target_path}'.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        updates: dict[str, Any] = {Keys.Tokenizer.CHAT_TEMPLATE: ver_template}
+        removals = [ver_key]
+
+        # Synchronize standard .backup key
+        remaining_versions = [v for v in downgrade_versions if v != choice]
+        if remaining_versions:
+            latest_rem = remaining_versions[-1]
+            latest_tpl = extract_gguf_metadata(target_path, f"{Keys.Tokenizer.CHAT_TEMPLATE}.{latest_rem}.bak")
+            if latest_tpl:
+                updates[f"{Keys.Tokenizer.CHAT_TEMPLATE}.backup"] = latest_tpl
+        else:
+            dist_tpl = extract_gguf_dist(target_path)
+            if dist_tpl:
+                updates[f"{Keys.Tokenizer.CHAT_TEMPLATE}.backup"] = dist_tpl
+
+        try:
+            success = gguf_set_metadata(target_path, updates, removals=removals)
+            if not success:
+                print(f"Error: Failed to downgrade GGUF metadata in '{target_path}'.", file=sys.stderr)
+                sys.exit(1)
+
+            restored_template = extract_gguf_chat_template(target_path)
+            remaining_ver_key = extract_gguf_metadata(target_path, ver_key)
+            if restored_template != ver_template or remaining_ver_key is not None:
+                print(
+                    f"Error: GGUF downgrade verification failed for '{target_path}'.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            print(f"Downgraded '{Keys.Tokenizer.CHAT_TEMPLATE}' to version '{choice}' in '{target_path}'")
+            return True
+        except Exception as e:
+            print(f"Error while downgrading GGUF metadata: {e}", file=sys.stderr)
+            sys.exit(1)
 
 
 def extract_template_version(content: str) -> str:
@@ -1326,7 +1736,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if selected_ggufs is not None:
             if args.uninstall:
-                backed_up_ggufs = [gf for gf in selected_ggufs if extract_gguf_backup(gf) is not None]
+                target_ver = getattr(args, "target_version", None)
+                backed_up_ggufs = [gf for gf in selected_ggufs if get_gguf_backup_versions(gf)]
                 if not backed_up_ggufs:
                     print(
                         "Error: No backup chat template found in the selected cached Hugging Face GGUF file(s).",
@@ -1334,7 +1745,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     return 1
                 for gf in backed_up_ggufs:
-                    if not uninstall_gguf(gf):
+                    if not uninstall_gguf(gf, force=args.force, target_version=target_ver):
                         return 1
                 if len(backed_up_ggufs) == 1:
                     print(
@@ -1365,7 +1776,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if target_path.is_dir():
             if args.uninstall:
-                uninstall_directory(target_path)
+                target_ver = getattr(args, "target_version", None)
+                if not uninstall_directory(target_path, force=args.force, target_version=target_ver):
+                    return 1
                 print("Successfully uninstalled chat template from directory.")
                 return 0
             patch_directory(target_path, SOURCE_TEMPLATE_PATH)
@@ -1379,7 +1792,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         elif is_gguf_file(target_path):
             if args.uninstall:
-                uninstall_gguf(target_path)
+                target_ver = getattr(args, "target_version", None)
+                if not uninstall_gguf(target_path, force=args.force, target_version=target_ver):
+                    return 1
                 print("Successfully uninstalled chat template from GGUF.")
                 return 0
             if is_hf_cache_path(target_path):

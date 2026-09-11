@@ -1843,6 +1843,609 @@ class TestApplyChatTemplate(unittest.TestCase):
         self.assertIn("HF_HUB_OFFLINE=1", res_yes.stderr)
         self.assertTrue(install.verify_gguf(gguf_path, SOURCE_TEMPLATE))
 
+    def test_dist_baseline_storage_and_immutability_directory(self):
+        """PASS: First directory install creates .dist baseline backups; second install preserves .dist immutably and creates versioned backup when upgrading version; FAIL: Overwrites .dist or fails to create versioned backup."""
+        model_dir = self.test_dir / "dist_immutability_dir"
+        model_dir.mkdir()
+
+        orig_jinja = "original stock jinja template"
+        orig_config = {
+            "bos_token": "<|im_start|>",
+            "chat_template": "original stock config template",
+        }
+        (model_dir / "chat_template.jinja").write_text(orig_jinja)
+        (model_dir / "tokenizer_config.json").write_text(json.dumps(orig_config, indent=2) + "\n")
+
+        # 1. Initial install with repository template (v22.5.1)
+        res1 = self.run_script(str(model_dir))
+        self.assertEqual(res1.returncode, 0, msg=f"Initial install failed: {res1.stderr}")
+
+        dist_jinja = model_dir / "chat_template.jinja.dist"
+        dist_config = model_dir / "tokenizer_config.json.dist"
+        bak_jinja = model_dir / "chat_template.jinja.bak"
+        bak_config = model_dir / "tokenizer_config.json.bak"
+
+        self.assertTrue(dist_jinja.is_file(), msg="chat_template.jinja.dist not created on first install.")
+        self.assertTrue(dist_config.is_file(), msg="tokenizer_config.json.dist not created on first install.")
+        self.assertEqual(dist_jinja.read_text(), orig_jinja, msg=".dist jinja content mismatch with original.")
+        self.assertEqual(json.loads(dist_config.read_text()), orig_config, msg=".dist config mismatch with original.")
+
+        self.assertTrue(bak_jinja.is_file(), msg="Legacy chat_template.jinja.bak not created.")
+        self.assertTrue(bak_config.is_file(), msg="Legacy tokenizer_config.json.bak not created.")
+
+        # 2. Re-install identical template: .dist must not be overwritten, no versioned backups
+        res2 = self.run_script(str(model_dir))
+        self.assertEqual(res2.returncode, 0, msg=f"Re-install failed: {res2.stderr}")
+        self.assertEqual(dist_jinja.read_text(), orig_jinja, msg=".dist jinja was modified on re-install.")
+        self.assertEqual(json.loads(dist_config.read_text()), orig_config, msg=".dist config was modified on re-install.")
+
+        versioned_baks_run2 = list(model_dir.glob("*.qwen3.8-honed-*.bak"))
+        self.assertEqual(versioned_baks_run2, [], msg=f"Unexpected versioned backups created on identical re-install: {versioned_baks_run2}")
+
+        # 3. Upgrade to custom version B
+        custom_tpl = self.test_dir / "custom_v22_6.jinja"
+        custom_content = '{%- set template_version = "qwen3.8-honed-v22.6.0" %}\nTurn 1: {{ messages[0].content }}'
+        custom_tpl.write_text(custom_content)
+
+        install.patch_directory(model_dir, custom_tpl)
+
+        # Baseline .dist must STILL be pristine
+        self.assertEqual(dist_jinja.read_text(), orig_jinja, msg=".dist jinja was overwritten during upgrade.")
+        self.assertEqual(json.loads(dist_config.read_text()), orig_config, msg=".dist config was overwritten during upgrade.")
+
+        # Versioned backup for previous installed version (v22.5.1) must exist
+        ver_jinja_bak = model_dir / "chat_template.jinja.qwen3.8-honed-v22.5.1.bak"
+        ver_config_bak = model_dir / "tokenizer_config.json.qwen3.8-honed-v22.5.1.bak"
+        self.assertTrue(ver_jinja_bak.is_file(), msg="Versioned backup for chat_template.jinja was not created.")
+        self.assertTrue(ver_config_bak.is_file(), msg="Versioned backup for tokenizer_config.json was not created.")
+
+        # Active template is updated to custom version
+        self.assertEqual((model_dir / "chat_template.jinja").read_text(), custom_content)
+
+    def test_dist_baseline_directory_without_prior_jinja(self):
+        """PASS: Model directory without prior jinja creates only tokenizer_config.json.dist; subsequent upgrades never create chat_template.jinja.dist; FAIL: Creates chat_template.jinja.dist when no jinja originally existed."""
+        model_dir = self.test_dir / "dist_no_prior_jinja"
+        model_dir.mkdir()
+
+        orig_config = {"model_type": "qwen2", "chat_template": "stock config"}
+        (model_dir / "tokenizer_config.json").write_text(json.dumps(orig_config, indent=2) + "\n")
+
+        # 1. Initial install
+        res1 = self.run_script(str(model_dir))
+        self.assertEqual(res1.returncode, 0)
+
+        dist_config = model_dir / "tokenizer_config.json.dist"
+        dist_jinja = model_dir / "chat_template.jinja.dist"
+        self.assertTrue(dist_config.is_file(), msg="tokenizer_config.json.dist not created.")
+        self.assertFalse(dist_jinja.exists(), msg="chat_template.jinja.dist was created when no jinja originally existed.")
+
+        # 2. Upgrade to version B
+        custom_tpl = self.test_dir / "custom_v22_6_no_prior.jinja"
+        custom_tpl.write_text('{%- set template_version = "qwen3.8-honed-v22.6.0" %}\nTest')
+
+        install.patch_directory(model_dir, custom_tpl)
+
+        # Baseline check
+        self.assertTrue(dist_config.is_file())
+        self.assertEqual(json.loads(dist_config.read_text()), orig_config)
+        self.assertFalse(dist_jinja.exists(), msg="chat_template.jinja.dist was created on upgrade when no jinja originally existed.")
+
+        # Versioned backup check
+        ver_jinja_bak = model_dir / "chat_template.jinja.qwen3.8-honed-v22.5.1.bak"
+        ver_config_bak = model_dir / "tokenizer_config.json.qwen3.8-honed-v22.5.1.bak"
+        self.assertTrue(ver_jinja_bak.is_file())
+        self.assertTrue(ver_config_bak.is_file())
+
+    def test_gguf_dist_preservation_and_versioned_backups(self):
+        """PASS: GGUF patch establishes tokenizer.chat_template.dist; subsequent version updates retain .dist immutably and add versioned backup keys; FAIL: Overwrites .dist or fails to create versioned backup key."""
+        gguf_path, orig_arr = self.create_synthetic_gguf(
+            "gguf_dist_test.gguf", template="stock gguf chat template", alignment=32
+        )
+
+        tpl_v1 = '{%- set template_version = "qwen3.8-honed-v22.4.0" %}\nTurn: {{ messages[0].content }}'
+        tpl_v2 = '{%- set template_version = "qwen3.8-honed-v22.5.0" %}\nTurn: {{ messages[0].content }}'
+        tpl_v3 = '{%- set template_version = "qwen3.8-honed-v22.6.0" %}\nTurn: {{ messages[0].content }}'
+
+        # 1. First patch (v1)
+        res1 = install.patch_gguf(gguf_path, tpl_v1, force=True)
+        self.assertTrue(res1)
+        self.assertEqual(install.extract_gguf_dist(gguf_path), "stock gguf chat template")
+        self.assertEqual(install.extract_gguf_backup(gguf_path), "stock gguf chat template")
+        self.assertEqual(install.extract_gguf_chat_template(gguf_path), tpl_v1)
+
+        # 2. Re-patch identical template (v1)
+        res2 = install.patch_gguf(gguf_path, tpl_v1, force=True)
+        self.assertTrue(res2)
+        self.assertEqual(install.extract_gguf_dist(gguf_path), "stock gguf chat template")
+        reader2 = gguf.GGUFReader(gguf_path, "r")
+        versioned_keys_r2 = [k for k in reader2.fields.keys() if k.startswith("tokenizer.chat_template.") and k.endswith(".bak")]
+        self.assertEqual(versioned_keys_r2, [], msg=f"Unexpected versioned backup key on identical patch: {versioned_keys_r2}")
+        del reader2
+
+        # 3. Upgrade to v2
+        res3 = install.patch_gguf(gguf_path, tpl_v2, force=True)
+        self.assertTrue(res3)
+        self.assertEqual(install.extract_gguf_dist(gguf_path), "stock gguf chat template", msg="GGUF .dist was overwritten.")
+        self.assertEqual(install.extract_gguf_backup(gguf_path), tpl_v1, msg="Legacy .backup does not point to replaced version.")
+        self.assertEqual(install.extract_gguf_chat_template(gguf_path), tpl_v2)
+
+        reader3 = gguf.GGUFReader(gguf_path, "r")
+        bak_v1_field = reader3.get_field("tokenizer.chat_template.qwen3.8-honed-v22.4.0.bak")
+        self.assertIsNotNone(bak_v1_field, msg="Versioned backup key tokenizer.chat_template.qwen3.8-honed-v22.4.0.bak not found.")
+        self.assertEqual(bak_v1_field.contents(), tpl_v1)
+        del reader3
+
+        # 4. Upgrade to v3
+        res4 = install.patch_gguf(gguf_path, tpl_v3, force=True)
+        self.assertTrue(res4)
+        self.assertEqual(install.extract_gguf_dist(gguf_path), "stock gguf chat template", msg="GGUF .dist was overwritten on second upgrade.")
+        self.assertEqual(install.extract_gguf_backup(gguf_path), tpl_v2)
+        self.assertEqual(install.extract_gguf_chat_template(gguf_path), tpl_v3)
+
+        reader4 = gguf.GGUFReader(gguf_path, "r")
+        # Both v1 and v2 backups must be retained in GGUF metadata
+        self.assertIsNotNone(reader4.get_field("tokenizer.chat_template.qwen3.8-honed-v22.4.0.bak"))
+        self.assertIsNotNone(reader4.get_field("tokenizer.chat_template.qwen3.8-honed-v22.5.0.bak"))
+        self.assertEqual(reader4.get_field("tokenizer.chat_template.qwen3.8-honed-v22.5.0.bak").contents(), tpl_v2)
+
+        # Tensor verification
+        tensor = reader4.get_tensor(0)
+        self.assertTrue(np.array_equal(tensor.data, orig_arr), msg="Tensor weights corrupted during multiple GGUF upgrades.")
+        del reader4
+
+    def test_helpers_ensure_dist_and_create_versioned_backup(self):
+        """PASS: ensure_dist_backup creates .dist and preserves existing; create_versioned_backup sanitizes versions and creates versioned + .bak copies; FAIL: Logic or sanitization error."""
+        test_file = self.test_dir / "helper_test.txt"
+        test_file.write_text("initial content")
+
+        # ensure_dist_backup creates .dist
+        dist = install.ensure_dist_backup(test_file)
+        self.assertTrue(dist.is_file())
+        self.assertEqual(dist.read_text(), "initial content")
+
+        # ensure_dist_backup does not overwrite existing .dist
+        test_file.write_text("modified content")
+        dist_again = install.ensure_dist_backup(test_file)
+        self.assertEqual(dist_again.read_text(), "initial content")
+
+        # create_versioned_backup creates sanitized version backup and updates .bak
+        ver_bak = install.create_versioned_backup(test_file, "v1.0.0 / beta")
+        expected_ver_bak = self.test_dir / "helper_test.txt.v1.0.0_beta.bak"
+        std_bak = self.test_dir / "helper_test.txt.bak"
+
+        self.assertEqual(ver_bak, expected_ver_bak)
+        self.assertTrue(expected_ver_bak.is_file())
+        self.assertEqual(expected_ver_bak.read_text(), "modified content")
+        self.assertTrue(std_bak.is_file())
+        self.assertEqual(std_bak.read_text(), "modified content")
+
+    def test_get_backup_versions_helpers_and_prompt_choice(self):
+        """PASS: get_directory_backup_versions and get_gguf_backup_versions discover versioned and dist backups; prompt_downgrade_choice handles numbers, aborts, and EOF; FAIL: Misses versions or prompt choice fails."""
+        model_dir = self.test_dir / "helpers_backup_dir"
+        model_dir.mkdir()
+
+        (model_dir / "tokenizer_config.json.dist").write_text("dist config")
+        (model_dir / "chat_template.jinja.dist").write_text("dist jinja")
+        (model_dir / "tokenizer_config.json.v22_4_0.bak").write_text("v22.4 config")
+        (model_dir / "chat_template.jinja.v22_4_0.bak").write_text("v22.4 jinja")
+        (model_dir / "tokenizer_config.json.v22_5_0.bak").write_text("v22.5 config")
+
+        dir_versions = install.get_directory_backup_versions(model_dir)
+        version_names = [v[0] for v in dir_versions]
+        self.assertIn("v22_4_0", version_names)
+        self.assertIn("v22_5_0", version_names)
+        self.assertIn("dist", version_names)
+
+        # GGUF helper test
+        gguf_path, _ = self.create_synthetic_gguf("helpers_test.gguf", template="stock")
+        install.patch_gguf(gguf_path, '{%- set template_version = "v1" %}\nt1', force=True)
+        install.patch_gguf(gguf_path, '{%- set template_version = "v2" %}\nt2', force=True)
+
+        gguf_versions = install.get_gguf_backup_versions(gguf_path)
+        self.assertIn("v1", gguf_versions)
+        self.assertIn("dist", gguf_versions)
+
+        # prompt_downgrade_choice test with mock input
+        with mock.patch("builtins.input", return_value="1"):
+            choice1 = install.prompt_downgrade_choice(["v22_4_0", "dist"])
+            self.assertEqual(choice1, "v22_4_0")
+
+        with mock.patch("builtins.input", return_value="2"):
+            choice2 = install.prompt_downgrade_choice(["v22_4_0", "dist"])
+            self.assertEqual(choice2, "dist")
+
+        with mock.patch("builtins.input", return_value="q"):
+            choice_q = install.prompt_downgrade_choice(["v22_4_0", "dist"])
+            self.assertIsNone(choice_q)
+
+        with mock.patch("builtins.input", side_effect=EOFError):
+            choice_eof = install.prompt_downgrade_choice(["v22_4_0", "dist"])
+            self.assertEqual(choice_eof, "dist")
+
+    def test_directory_interactive_downgrade_and_complete_revert(self):
+        """PASS: --uninstall interactively downgrades to previous version backup; second uninstall reverts completely to .dist; FAIL: Active template incorrect or artifacts retained."""
+        model_dir = self.test_dir / "interactive_downgrade_dir"
+        model_dir.mkdir()
+
+        orig_jinja = "original baseline jinja"
+        orig_config = {"chat_template": "original baseline config"}
+        (model_dir / "chat_template.jinja").write_text(orig_jinja)
+        (model_dir / "tokenizer_config.json").write_text(json.dumps(orig_config, indent=2) + "\n")
+
+        # 1. Install version A
+        tpl_a = self.test_dir / "tpl_a.jinja"
+        tpl_a.write_text('{%- set template_version = "qwen3.8-honed-v22.4.0" %}\nVersion A template')
+        install.patch_directory(model_dir, tpl_a)
+
+        # 2. Upgrade to version B
+        tpl_b = self.test_dir / "tpl_b.jinja"
+        tpl_b.write_text('{%- set template_version = "qwen3.8-honed-v22.5.0" %}\nVersion B template')
+        install.patch_directory(model_dir, tpl_b)
+
+        # Verify active is Version B, versioned backup of A exists, and .dist exists
+        self.assertIn("Version B", (model_dir / "chat_template.jinja").read_text())
+        self.assertTrue((model_dir / "chat_template.jinja.qwen3.8-honed-v22.4.0.bak").is_file())
+        self.assertTrue((model_dir / "tokenizer_config.json.dist").is_file())
+
+        # 3. Interactive uninstall: enter "1" to downgrade to version A
+        res_down = self.run_script(str(model_dir), "--uninstall", input="1\n")
+        self.assertEqual(res_down.returncode, 0, msg=f"Downgrade failed: {res_down.stderr}")
+        self.assertIn("Successfully downgraded chat template to version 'qwen3.8-honed-v22.4.0'", res_down.stdout)
+
+        # Verify active is now Version A
+        self.assertIn("Version A", (model_dir / "chat_template.jinja").read_text())
+        # Version A backup artifact must be removed
+        self.assertFalse((model_dir / "chat_template.jinja.qwen3.8-honed-v22.4.0.bak").exists())
+        self.assertFalse((model_dir / "tokenizer_config.json.qwen3.8-honed-v22.4.0.bak").exists())
+        # .dist files remain intact
+        self.assertTrue((model_dir / "tokenizer_config.json.dist").is_file())
+        self.assertTrue((model_dir / "chat_template.jinja.dist").is_file())
+
+        # 4. Uninstall again: only .dist remains, so reverts to baseline
+        res_revert = self.run_script(str(model_dir), "--uninstall")
+        self.assertEqual(res_revert.returncode, 0, msg=f"Revert failed: {res_revert.stderr}")
+        self.assertIn("Successfully uninstalled chat template from directory.", res_revert.stdout)
+
+        # Verify original baseline restored and all backup files cleaned up
+        self.assertEqual((model_dir / "chat_template.jinja").read_text(), orig_jinja)
+        self.assertEqual(json.loads((model_dir / "tokenizer_config.json").read_text()), orig_config)
+        self.assertFalse((model_dir / "tokenizer_config.json.dist").exists())
+        self.assertFalse((model_dir / "chat_template.jinja.dist").exists())
+        self.assertFalse((model_dir / "tokenizer_config.json.bak").exists())
+        self.assertFalse((model_dir / "chat_template.jinja.bak").exists())
+
+    def test_gguf_interactive_downgrade_and_complete_revert(self):
+        """PASS: GGUF downgrade restores intermediate version metadata and preserves .dist; full revert restores baseline and cleans all backup keys; FAIL: Restore incorrect or metadata keys leaked."""
+        gguf_path, orig_arr = self.create_synthetic_gguf("interactive_gguf.gguf", template="stock gguf")
+
+        tpl_a = '{%- set template_version = "qwen3.8-honed-v22.4.0" %}\nTemplate A'
+        tpl_b = '{%- set template_version = "qwen3.8-honed-v22.5.0" %}\nTemplate B'
+
+        install.patch_gguf(gguf_path, tpl_a, force=True)
+        install.patch_gguf(gguf_path, tpl_b, force=True)
+
+        self.assertEqual(install.extract_gguf_chat_template(gguf_path), tpl_b)
+        self.assertEqual(install.extract_gguf_dist(gguf_path), "stock gguf")
+
+        # 1. Downgrade interactively: select option 1 (version A)
+        res_down = self.run_script(str(gguf_path), "--uninstall", input="1\n")
+        self.assertEqual(res_down.returncode, 0, msg=f"GGUF downgrade failed: {res_down.stderr}")
+        self.assertIn("Downgraded 'tokenizer.chat_template' to version 'qwen3.8-honed-v22.4.0'", res_down.stdout)
+
+        self.assertEqual(install.extract_gguf_chat_template(gguf_path), tpl_a)
+        self.assertEqual(install.extract_gguf_dist(gguf_path), "stock gguf", msg="GGUF .dist was removed or modified during downgrade.")
+        self.assertIsNone(install.extract_gguf_metadata(gguf_path, "tokenizer.chat_template.qwen3.8-honed-v22.4.0.bak"))
+
+        # Verify tensor weights remain intact after downgrade
+        reader = gguf.GGUFReader(gguf_path, "r")
+        self.assertTrue(np.array_equal(reader.get_tensor(0).data, orig_arr))
+        del reader
+
+        # 2. Revert completely to baseline
+        res_revert = self.run_script(str(gguf_path), "--uninstall", "--force")
+        self.assertEqual(res_revert.returncode, 0, msg=f"GGUF full revert failed: {res_revert.stderr}")
+        self.assertEqual(install.extract_gguf_chat_template(gguf_path), "stock gguf")
+        self.assertIsNone(install.extract_gguf_dist(gguf_path))
+        self.assertIsNone(install.extract_gguf_backup(gguf_path))
+
+        reader2 = gguf.GGUFReader(gguf_path, "r")
+        self.assertTrue(np.array_equal(reader2.get_tensor(0).data, orig_arr))
+        del reader2
+
+    def test_directory_legacy_backup_migration_and_uninstall(self):
+        """PASS: Directory with legacy .bak backfills .dist on install or restores cleanly on uninstall; FAIL: Baseline lost or restore fails."""
+        # Case A: Legacy backup backfilled on patch_directory
+        model_dir_a = self.test_dir / "legacy_backfill_dir"
+        model_dir_a.mkdir()
+        orig_config = {"chat_template": "stock old config"}
+        patched_config = {"chat_template": "already patched config"}
+        (model_dir_a / "tokenizer_config.json").write_text(json.dumps(patched_config, indent=2))
+        (model_dir_a / "tokenizer_config.json.bak").write_text(json.dumps(orig_config, indent=2))
+
+        tpl_new = self.test_dir / "tpl_new.jinja"
+        tpl_new.write_text('{%- set template_version = "qwen3.8-honed-v22.6.0" %}\nNew Template')
+        install.patch_directory(model_dir_a, tpl_new)
+
+        dist_file = model_dir_a / "tokenizer_config.json.dist"
+        self.assertTrue(dist_file.is_file())
+        self.assertEqual(json.loads(dist_file.read_text()), orig_config, msg=".dist was not backfilled from legacy .bak.")
+
+        # Case B: Legacy directory with only .bak uninstalls cleanly
+        model_dir_b = self.test_dir / "legacy_uninst_dir"
+        model_dir_b.mkdir()
+        (model_dir_b / "tokenizer_config.json").write_text(json.dumps(patched_config, indent=2))
+        (model_dir_b / "tokenizer_config.json.bak").write_text(json.dumps(orig_config, indent=2))
+
+        res_uninst = self.run_script(str(model_dir_b), "--uninstall")
+        self.assertEqual(res_uninst.returncode, 0)
+        self.assertEqual(json.loads((model_dir_b / "tokenizer_config.json").read_text()), orig_config)
+        self.assertFalse((model_dir_b / "tokenizer_config.json.bak").exists())
+
+    def test_directory_uninstall_non_interactive_fallback(self):
+        """PASS: --uninstall --force or non-interactive on multi-version directory defaults to full revert to .dist; FAIL: Prompts or fails to revert."""
+        model_dir = self.test_dir / "non_interactive_dir"
+        model_dir.mkdir()
+
+        orig_config = {"chat_template": "original baseline"}
+        (model_dir / "tokenizer_config.json").write_text(json.dumps(orig_config, indent=2))
+
+        # First install
+        install.patch_directory(model_dir, SOURCE_TEMPLATE)
+
+        # Upgrade to custom version
+        custom_tpl = self.test_dir / "custom_tpl.jinja"
+        custom_tpl.write_text('{%- set template_version = "qwen3.8-honed-v22.9.0" %}\nCustom')
+        install.patch_directory(model_dir, custom_tpl)
+
+        # Run uninstall with --force (bypasses prompt and reverts to .dist)
+        res = self.run_script(str(model_dir), "--uninstall", "--force")
+        self.assertEqual(res.returncode, 0)
+        self.assertEqual(json.loads((model_dir / "tokenizer_config.json").read_text()), orig_config)
+        self.assertFalse((model_dir / "tokenizer_config.json.dist").exists())
+        self.assertFalse((model_dir / "tokenizer_config.json.qwen3.8-honed-v22.5.1.bak").exists())
+
+    def test_repeat_install_preserves_dist_and_stock_templates_cli(self):
+        """PASS: Running installer multiple times via CLI preserves .dist immutably even after modifications; FAIL: Overwrites .dist on repeat runs."""
+        # 1. Directory mode
+        model_dir = self.test_dir / "repeat_install_cli_dir"
+        model_dir.mkdir()
+        orig_config = {"model_type": "qwen2", "chat_template": "stock config baseline"}
+        orig_jinja = "stock jinja baseline"
+        (model_dir / "tokenizer_config.json").write_text(json.dumps(orig_config, indent=2) + "\n")
+        (model_dir / "chat_template.jinja").write_text(orig_jinja)
+
+        # Initial install run
+        res1 = self.run_script(str(model_dir))
+        self.assertEqual(res1.returncode, 0)
+        dist_config = model_dir / "tokenizer_config.json.dist"
+        dist_jinja = model_dir / "chat_template.jinja.dist"
+        self.assertTrue(dist_config.is_file())
+        self.assertTrue(dist_jinja.is_file())
+        self.assertEqual(json.loads(dist_config.read_text()), orig_config)
+        self.assertEqual(dist_jinja.read_text(), orig_jinja)
+
+        # Second install run (immediate repeat)
+        res2 = self.run_script(str(model_dir))
+        self.assertEqual(res2.returncode, 0)
+        self.assertEqual(json.loads(dist_config.read_text()), orig_config)
+        self.assertEqual(dist_jinja.read_text(), orig_jinja)
+
+        # Third install run after manual modification of active files
+        (model_dir / "chat_template.jinja").write_text("user modified template")
+        (model_dir / "tokenizer_config.json").write_text(json.dumps({"chat_template": "user modified config"}, indent=2) + "\n")
+        res3 = self.run_script(str(model_dir))
+        self.assertEqual(res3.returncode, 0)
+        # .dist MUST still hold the original stock baseline, not the user-modified content
+        self.assertEqual(json.loads(dist_config.read_text()), orig_config)
+        self.assertEqual(dist_jinja.read_text(), orig_jinja)
+
+        # 2. GGUF mode
+        gguf_path, orig_arr = self.create_synthetic_gguf("repeat_install.gguf", template="stock gguf baseline")
+        res_gguf1 = self.run_script(str(gguf_path), "--force")
+        self.assertEqual(res_gguf1.returncode, 0)
+        self.assertEqual(install.extract_gguf_dist(gguf_path), "stock gguf baseline")
+
+        res_gguf2 = self.run_script(str(gguf_path), "--force")
+        self.assertEqual(res_gguf2.returncode, 0)
+        self.assertEqual(install.extract_gguf_dist(gguf_path), "stock gguf baseline")
+
+        reader = gguf.GGUFReader(gguf_path, "r")
+        self.assertTrue(np.array_equal(reader.get_tensor(0).data, orig_arr))
+        del reader
+
+    def test_identical_reinstall_creates_no_redundant_or_corrupted_backups(self):
+        """PASS: Repeated identical installation runs create no redundant versioned backups or corrupted files; FAIL: Generates redundant backups on identical template."""
+        model_dir = self.test_dir / "identical_reinstall_dir"
+        model_dir.mkdir()
+        orig_config = {"chat_template": "stock"}
+        (model_dir / "tokenizer_config.json").write_text(json.dumps(orig_config, indent=2) + "\n")
+        (model_dir / "chat_template.jinja").write_text("stock")
+
+        # Run 1
+        res1 = self.run_script(str(model_dir))
+        self.assertEqual(res1.returncode, 0)
+
+        # Check existing backups: only .dist and .bak
+        initial_baks = list(model_dir.glob("*.bak"))
+        self.assertEqual(len(initial_baks), 2)  # tokenizer_config.json.bak and chat_template.jinja.bak
+
+        # Run 2
+        res2 = self.run_script(str(model_dir))
+        self.assertEqual(res2.returncode, 0)
+        self.assertIn("already up to date; skipping redundant backup creation", res2.stdout)
+        baks_after_run2 = list(model_dir.glob("*.bak"))
+        self.assertEqual(len(baks_after_run2), 2)
+        versioned_baks_run2 = list(model_dir.glob("*.qwen3.8-honed-*.bak"))
+        self.assertEqual(versioned_baks_run2, [])
+
+        # Run 3
+        res3 = self.run_script(str(model_dir))
+        self.assertEqual(res3.returncode, 0)
+        self.assertIn("already up to date; skipping redundant backup creation", res3.stdout)
+        baks_after_run3 = list(model_dir.glob("*.bak"))
+        self.assertEqual(len(baks_after_run3), 2)
+        self.assertEqual(list(model_dir.glob("*.qwen3.8-honed-*.bak")), [])
+
+        # GGUF identical repeat
+        gguf_path, orig_arr = self.create_synthetic_gguf("identical_gguf.gguf", template="stock")
+        install.patch_gguf(gguf_path, "template content", force=True)
+        install.patch_gguf(gguf_path, "template content", force=True)
+        install.patch_gguf(gguf_path, "template content", force=True)
+
+        reader = gguf.GGUFReader(gguf_path, "r")
+        version_bak_keys = [k for k in reader.fields.keys() if k.startswith("tokenizer.chat_template.") and k.endswith(".bak")]
+        self.assertEqual(version_bak_keys, [])
+        self.assertTrue(np.array_equal(reader.get_tensor(0).data, orig_arr))
+        del reader
+
+    def test_interactive_downgrade_prompt_options_and_target_version_flag(self):
+        """PASS: Interactive prompt handles abort ('q'), selection by version name, and --target-version CLI flag for directory and GGUF; FAIL: Fails to abort or downgrade correctly."""
+        # 1. Directory mode
+        model_dir = self.test_dir / "target_ver_cli_dir"
+        model_dir.mkdir()
+        orig_config = {"chat_template": "stock config"}
+        (model_dir / "tokenizer_config.json").write_text(json.dumps(orig_config, indent=2) + "\n")
+        (model_dir / "chat_template.jinja").write_text("stock jinja")
+
+        tpl_v1 = self.test_dir / "tpl_v1.jinja"
+        tpl_v1.write_text('{%- set template_version = "qwen3.8-honed-v22.4.0" %}\nVersion 1')
+        install.patch_directory(model_dir, tpl_v1)
+
+        tpl_v2 = self.test_dir / "tpl_v2.jinja"
+        tpl_v2.write_text('{%- set template_version = "qwen3.8-honed-v22.5.0" %}\nVersion 2')
+        install.patch_directory(model_dir, tpl_v2)
+
+        # Abort interactive prompt with 'q'
+        res_abort = self.run_script(str(model_dir), "--uninstall", input="q\n")
+        self.assertEqual(res_abort.returncode, 1)
+        self.assertIn("Aborted by user.", res_abort.stderr)
+        self.assertIn("Version 2", (model_dir / "chat_template.jinja").read_text())
+
+        # Select by entering version name string interactively
+        res_name = self.run_script(str(model_dir), "--uninstall", input="qwen3.8-honed-v22.4.0\n")
+        self.assertEqual(res_name.returncode, 0)
+        self.assertIn("Successfully downgraded chat template to version 'qwen3.8-honed-v22.4.0'", res_name.stdout)
+        self.assertIn("Version 1", (model_dir / "chat_template.jinja").read_text())
+
+        # Re-upgrade to v2, then use --target-version CLI flag non-interactively
+        install.patch_directory(model_dir, tpl_v2)
+        res_flag = self.run_script(str(model_dir), "--uninstall", "--target-version", "qwen3.8-honed-v22.4.0")
+        self.assertEqual(res_flag.returncode, 0)
+        self.assertIn("Successfully downgraded chat template to version 'qwen3.8-honed-v22.4.0'", res_flag.stdout)
+        self.assertIn("Version 1", (model_dir / "chat_template.jinja").read_text())
+
+        # Invalid --target-version fails
+        res_bad = self.run_script(str(model_dir), "--uninstall", "--target-version", "nonexistent-version")
+        self.assert_subprocess_failure(res_bad, description="Invalid target version", expected_stderr="not found", expected_exit_code=1)
+
+        # 2. GGUF mode with --target-version
+        gguf_path, orig_arr = self.create_synthetic_gguf("target_ver_gguf.gguf", template="stock")
+        install.patch_gguf(gguf_path, '{%- set template_version = "v1" %}\nt1', force=True)
+        install.patch_gguf(gguf_path, '{%- set template_version = "v2" %}\nt2', force=True)
+
+        res_gguf_down = self.run_script(str(gguf_path), "--uninstall", "--target-version", "v1")
+        self.assertEqual(res_gguf_down.returncode, 0)
+        self.assertEqual(install.extract_gguf_chat_template(gguf_path), '{%- set template_version = "v1" %}\nt1')
+
+        res_gguf_bad = self.run_script(str(gguf_path), "--uninstall", "--target-version", "v999")
+        self.assert_subprocess_failure(res_gguf_bad, description="Invalid GGUF target version", expected_stderr="not found", expected_exit_code=1)
+
+    def test_complete_uninstall_reverts_to_dist_and_removes_all_artifacts(self):
+        """PASS: Complete uninstall from multi-version directory cleanly restores stock .dist, unlinks created jinja, and deletes all backup artifacts; FAIL: Artifacts remain or restore incorrect."""
+        model_dir = self.test_dir / "complete_uninst_dir"
+        model_dir.mkdir()
+        orig_config = {"model_type": "qwen2", "chat_template": "stock config"}
+        (model_dir / "tokenizer_config.json").write_text(json.dumps(orig_config, indent=2) + "\n")
+        # Notice: No chat_template.jinja originally!
+
+        # Install version 1
+        tpl_v1 = self.test_dir / "compl_v1.jinja"
+        tpl_v1.write_text('{%- set template_version = "v22.1.0" %}\nV1')
+        install.patch_directory(model_dir, tpl_v1)
+
+        # Upgrade to version 2
+        tpl_v2 = self.test_dir / "compl_v2.jinja"
+        tpl_v2.write_text('{%- set template_version = "v22.2.0" %}\nV2')
+        install.patch_directory(model_dir, tpl_v2)
+
+        # Verify artifacts exist before complete uninstall
+        self.assertTrue((model_dir / "tokenizer_config.json.dist").is_file())
+        self.assertTrue((model_dir / "tokenizer_config.json.v22.1.0.bak").is_file())
+        self.assertTrue((model_dir / "chat_template.jinja").is_file())
+        self.assertTrue((model_dir / "chat_template.jinja.v22.1.0.bak").is_file())
+
+        # Complete uninstall via --uninstall --force
+        res = self.run_script(str(model_dir), "--uninstall", "--force")
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("Successfully uninstalled chat template from directory.", res.stdout)
+
+        # Config restored to exact stock
+        self.assertEqual(json.loads((model_dir / "tokenizer_config.json").read_text()), orig_config)
+        # chat_template.jinja must be REMOVED completely since no .dist existed
+        self.assertFalse((model_dir / "chat_template.jinja").exists())
+        # All backup files must be wiped
+        remaining_files = [f.name for f in model_dir.iterdir()]
+        self.assertEqual(remaining_files, ["tokenizer_config.json"])
+
+        # Test interactive selection of "dist" directly from menu
+        model_dir_dist = self.test_dir / "interactive_dist_dir"
+        model_dir_dist.mkdir()
+        orig_config_dist = {"chat_template": "stock config 2"}
+        (model_dir_dist / "tokenizer_config.json").write_text(json.dumps(orig_config_dist, indent=2) + "\n")
+        (model_dir_dist / "chat_template.jinja").write_text("stock jinja 2")
+
+        tpl_v1_d = self.test_dir / "dist_v1.jinja"
+        tpl_v1_d.write_text('{%- set template_version = "v22.1.0" %}\nV1')
+        install.patch_directory(model_dir_dist, tpl_v1_d)
+
+        tpl_v2_d = self.test_dir / "dist_v2.jinja"
+        tpl_v2_d.write_text('{%- set template_version = "v22.2.0" %}\nV2')
+        install.patch_directory(model_dir_dist, tpl_v2_d)
+
+        # Enter "dist\n" to select full revert directly
+        res_inter_dist = self.run_script(str(model_dir_dist), "--uninstall", input="dist\n")
+        self.assertEqual(res_inter_dist.returncode, 0)
+        self.assertEqual(json.loads((model_dir_dist / "tokenizer_config.json").read_text()), orig_config_dist)
+        self.assertEqual((model_dir_dist / "chat_template.jinja").read_text(), "stock jinja 2")
+        self.assertFalse((model_dir_dist / "tokenizer_config.json.dist").exists())
+        self.assertFalse((model_dir_dist / "chat_template.jinja.dist").exists())
+
+    def test_non_interactive_uninstall_fallback_on_closed_stdin(self):
+        """PASS: When standard input is closed (EOF), uninstaller catches EOFError, logs fallback warning, and executes full .dist reversion; FAIL: Raises unhandled EOFError or crashes."""
+        # 1. Directory mode
+        model_dir = self.test_dir / "eof_dir"
+        model_dir.mkdir()
+        orig_config = {"chat_template": "stock baseline"}
+        (model_dir / "tokenizer_config.json").write_text(json.dumps(orig_config, indent=2) + "\n")
+
+        install.patch_directory(model_dir, SOURCE_TEMPLATE)
+        tpl2 = self.test_dir / "eof_tpl.jinja"
+        tpl2.write_text('{%- set template_version = "v2" %}\nT2')
+        install.patch_directory(model_dir, tpl2)
+
+        # Run with input="" (immediate EOF)
+        res_dir = self.run_script(str(model_dir), "--uninstall", input="")
+        self.assertEqual(res_dir.returncode, 0)
+        self.assertIn("Standard input closed. Defaulting to complete revert to .dist baseline.", res_dir.stderr)
+        self.assertEqual(json.loads((model_dir / "tokenizer_config.json").read_text()), orig_config)
+        self.assertFalse((model_dir / "tokenizer_config.json.dist").exists())
+
+        # 2. GGUF mode
+        gguf_path, orig_arr = self.create_synthetic_gguf("eof_gguf.gguf", template="stock")
+        install.patch_gguf(gguf_path, '{%- set template_version = "v1" %}\nt1', force=True)
+        install.patch_gguf(gguf_path, '{%- set template_version = "v2" %}\nt2', force=True)
+
+        res_gguf = self.run_script(str(gguf_path), "--uninstall", input="")
+        self.assertEqual(res_gguf.returncode, 0)
+        self.assertIn("Standard input closed. Defaulting to complete revert to .dist baseline.", res_gguf.stderr)
+        self.assertEqual(install.extract_gguf_chat_template(gguf_path), "stock")
+        self.assertIsNone(install.extract_gguf_dist(gguf_path))
+        self.assertIsNone(install.extract_gguf_backup(gguf_path))
+
+        reader = gguf.GGUFReader(gguf_path, "r")
+        self.assertTrue(np.array_equal(reader.get_tensor(0).data, orig_arr))
+        del reader
+
 
 if __name__ == "__main__":
     unittest.main()
