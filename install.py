@@ -153,7 +153,10 @@ def find_cached_repo(
         if repo.repo_id == repo_id:
             return repo
     for repo in cache_info.repos:
-        if getattr(repo, "repo_type", None) == "model" and repo.repo_id.lower() == repo_id.lower():
+        if (
+            getattr(repo, "repo_type", None) == "model"
+            and repo.repo_id.lower() == repo_id.lower()
+        ):
             return repo
     for repo in cache_info.repos:
         if repo.repo_id.lower() == repo_id.lower():
@@ -181,7 +184,8 @@ def resolve_hf_model_path(
     revisions = [
         rev
         for rev in target_repo.revisions
-        if getattr(rev, "snapshot_path", None) is not None and Path(rev.snapshot_path).is_dir()
+        if getattr(rev, "snapshot_path", None) is not None
+        and Path(rev.snapshot_path).is_dir()
     ]
     if not revisions:
         return None
@@ -193,8 +197,14 @@ def resolve_hf_model_path(
 
     print(f"Multiple revisions found in Hugging Face cache for '{repo_id}':")
     for i, rev in enumerate(revisions, 1):
-        commit_short = rev.commit_hash[:10] if len(rev.commit_hash) >= 10 else rev.commit_hash
-        refs_str = f" (refs: {', '.join(sorted(rev.refs))})" if getattr(rev, "refs", None) else ""
+        commit_short = (
+            rev.commit_hash[:10] if len(rev.commit_hash) >= 10 else rev.commit_hash
+        )
+        refs_str = (
+            f" (refs: {', '.join(sorted(rev.refs))})"
+            if getattr(rev, "refs", None)
+            else ""
+        )
         print(
             f"  [{i}] Commit: {commit_short}{refs_str} | "
             f"Modified: {getattr(rev, 'last_modified_str', '')} | "
@@ -219,9 +229,7 @@ def resolve_hf_model_path(
                 return Path(revisions[idx - 1].snapshot_path).resolve()
 
         matches = [
-            r
-            for r in revisions
-            if r.commit_hash.lower().startswith(choice.lower())
+            r for r in revisions if r.commit_hash.lower().startswith(choice.lower())
         ]
         if len(matches) == 1:
             return Path(matches[0].snapshot_path).resolve()
@@ -232,11 +240,7 @@ def resolve_hf_model_path(
             )
             continue
 
-        ref_matches = [
-            r
-            for r in revisions
-            if choice in getattr(r, "refs", ())
-        ]
+        ref_matches = [r for r in revisions if choice in getattr(r, "refs", ())]
         if len(ref_matches) == 1:
             return Path(ref_matches[0].snapshot_path).resolve()
         elif len(ref_matches) > 1:
@@ -293,7 +297,10 @@ def find_snapshot_gguf_files(snapshot_dir: Path) -> list[Path]:
     if not snapshot_dir.is_dir():
         return []
     gguf_files: list[Path] = []
-    for p in sorted(snapshot_dir.rglob("*.gguf"), key=lambda x: str(x.relative_to(snapshot_dir)).lower()):
+    for p in sorted(
+        snapshot_dir.rglob("*.gguf"),
+        key=lambda x: str(x.relative_to(snapshot_dir)).lower(),
+    ):
         if p.is_file() and is_gguf_file(p):
             gguf_files.append(p)
     return gguf_files
@@ -537,7 +544,9 @@ def backup_file(path: Path) -> Path:
     return bak_path
 
 
-def get_directory_backup_versions(target_dir: Path | str) -> list[tuple[str, Path, Path | None]]:
+def get_directory_backup_versions(
+    target_dir: Path | str,
+) -> list[tuple[str, Path, Path | None]]:
     """Discover all available versioned backups and the .dist baseline in a model directory.
 
     Returns a list of tuples: (version, config_backup_path, jinja_backup_path_or_None).
@@ -570,7 +579,9 @@ def get_directory_backup_versions(target_dir: Path | str) -> list[tuple[str, Pat
     bak_jinja = target_dir / f"{SOURCE_TEMPLATE_NAME}.bak"
 
     if dist_config.is_file():
-        results.append(("dist", dist_config, dist_jinja if dist_jinja.is_file() else None))
+        results.append(
+            ("dist", dist_config, dist_jinja if dist_jinja.is_file() else None)
+        )
     elif bak_config.is_file():
         results.append(("dist", bak_config, bak_jinja if bak_jinja.is_file() else None))
 
@@ -656,18 +667,26 @@ def patch_directory(target_dir: Path, source_template_path: Path) -> None:
         sys.exit(1)
 
     # 1. Establish immutable .dist baseline backups or create versioned backups
-    config_dist_path = tokenizer_config_path.with_name(f"{tokenizer_config_path.name}{DIST_SUFFIX}")
+    config_dist_path = tokenizer_config_path.with_name(
+        f"{tokenizer_config_path.name}{DIST_SUFFIX}"
+    )
     is_initial_install = not config_dist_path.is_file()
 
     if is_initial_install:
-        bak_config = tokenizer_config_path.with_name(f"{tokenizer_config_path.name}.bak")
-        bak_template = target_template_path.with_name(f"{target_template_path.name}.bak")
+        bak_config = tokenizer_config_path.with_name(
+            f"{tokenizer_config_path.name}.bak"
+        )
+        bak_template = target_template_path.with_name(
+            f"{target_template_path.name}.bak"
+        )
         if bak_config.is_file():
             # Legacy migration: backfill .dist from pre-existing .bak
             shutil.copy2(bak_config, config_dist_path)
             print(f"Created baseline from legacy backup: {config_dist_path}")
             if bak_template.is_file():
-                dist_template = target_template_path.with_name(f"{target_template_path.name}{DIST_SUFFIX}")
+                dist_template = target_template_path.with_name(
+                    f"{target_template_path.name}{DIST_SUFFIX}"
+                )
                 shutil.copy2(bak_template, dist_template)
                 print(f"Created baseline from legacy backup: {dist_template}")
             is_initial_install = False
@@ -684,7 +703,11 @@ def patch_directory(target_dir: Path, source_template_path: Path) -> None:
         print(f"Created backup: {bak_config}")
     else:
         # Baseline already established; never overwrite .dist files.
-        installed_jinja = target_template_path.read_text(encoding="utf-8") if target_template_path.is_file() else None
+        installed_jinja = (
+            target_template_path.read_text(encoding="utf-8")
+            if target_template_path.is_file()
+            else None
+        )
         installed_config_template = config_data.get("chat_template")
 
         templates_identical = (
@@ -702,12 +725,18 @@ def patch_directory(target_dir: Path, source_template_path: Path) -> None:
                 installed_version = "Unknown"
 
             if target_template_path.is_file():
-                ver_template = create_versioned_backup(target_template_path, installed_version)
+                ver_template = create_versioned_backup(
+                    target_template_path, installed_version
+                )
                 print(f"Created versioned backup: {ver_template}")
-            ver_config = create_versioned_backup(tokenizer_config_path, installed_version)
+            ver_config = create_versioned_backup(
+                tokenizer_config_path, installed_version
+            )
             print(f"Created versioned backup: {ver_config}")
         else:
-            print("Chat template is already up to date; skipping redundant backup creation.")
+            print(
+                "Chat template is already up to date; skipping redundant backup creation."
+            )
 
     # 2. Copy source chat_template.jinja into the target directory
     shutil.copy2(source_template_path, target_template_path)
@@ -805,7 +834,9 @@ def uninstall_directory(
         elif target_template_path.is_file():
             try:
                 target_template_path.unlink()
-                print(f"Removed '{target_template_path.name}' (created during installation).")
+                print(
+                    f"Removed '{target_template_path.name}' (created during installation)."
+                )
             except Exception as e:
                 print(
                     f"Error: Failed to remove '{target_template_path}': {e}",
@@ -851,7 +882,9 @@ def uninstall_directory(
         try:
             shutil.copy2(ver_config, tokenizer_config_path)
             ver_config.unlink()
-            print(f"Restored '{tokenizer_config_path.name}' from version '{choice}' backup.")
+            print(
+                f"Restored '{tokenizer_config_path.name}' from version '{choice}' backup."
+            )
         except Exception as e:
             print(
                 f"Error: Failed to restore '{tokenizer_config_path}' from version '{choice}': {e}",
@@ -863,7 +896,9 @@ def uninstall_directory(
             try:
                 shutil.copy2(ver_jinja, target_template_path)
                 ver_jinja.unlink()
-                print(f"Restored '{target_template_path.name}' from version '{choice}' backup.")
+                print(
+                    f"Restored '{target_template_path.name}' from version '{choice}' backup."
+                )
             except Exception as e:
                 print(
                     f"Error: Failed to restore '{target_template_path}' from version '{choice}': {e}",
@@ -872,7 +907,9 @@ def uninstall_directory(
                 sys.exit(1)
 
         # Synchronize standard .bak files with next newest remaining backup or .dist
-        remaining = [v for v in get_directory_backup_versions(target_dir) if v[0] != "dist"]
+        remaining = [
+            v for v in get_directory_backup_versions(target_dir) if v[0] != "dist"
+        ]
         if remaining:
             newest_ver = remaining[-1]
             shutil.copy2(newest_ver[1], target_dir / "tokenizer_config.json.bak")
@@ -918,7 +955,9 @@ def pack_kv_data(
         res += struct.pack(f"{prefix}I", int(GGUFValueType.FLOAT32))
         res += struct.pack(f"{prefix}f", val)
     else:
-        raise ValueError(f"Unsupported metadata value type for key '{key}': {type(val)}")
+        raise ValueError(
+            f"Unsupported metadata value type for key '{key}': {type(val)}"
+        )
     return bytes(res)
 
 
@@ -1143,7 +1182,9 @@ def restore_gguf_backup(target_path: Path | str) -> bool:
     )
 
 
-def patch_gguf(target_path: Path, minified_template: str, force: bool = False) -> bool | None:
+def patch_gguf(
+    target_path: Path, minified_template: str, force: bool = False
+) -> bool | None:
     """Patch GGUF file metadata with a minified chat template.
 
     Safely updates 'tokenizer.chat_template' in-place and preserves the original template
@@ -1154,7 +1195,10 @@ def patch_gguf(target_path: Path, minified_template: str, force: bool = False) -
 
     # 1. Validate GGUF file existence and header magic
     if not target_path.is_file():
-        print(f"Error: Target path '{target_path}' is not a regular file.", file=sys.stderr)
+        print(
+            f"Error: Target path '{target_path}' is not a regular file.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     try:
@@ -1237,7 +1281,9 @@ def patch_gguf(target_path: Path, minified_template: str, force: bool = False) -
 
         # 1. Establish immutable .dist baseline on initial patch
         if existing_dist is None:
-            baseline_template = existing_backup if existing_backup is not None else existing_template
+            baseline_template = (
+                existing_backup if existing_backup is not None else existing_template
+            )
             if baseline_template is not None:
                 updates[f"{Keys.Tokenizer.CHAT_TEMPLATE}.dist"] = baseline_template
 
@@ -1252,7 +1298,10 @@ def patch_gguf(target_path: Path, minified_template: str, force: bool = False) -
             # Already patched GGUF: check if payload template differs from installed
             if existing_template is not None and existing_template != minified_template:
                 installed_version = extract_template_version(existing_template)
-                safe_version = re.sub(r"[^a-zA-Z0-9_.-]+", "_", installed_version).strip("_") or "unknown"
+                safe_version = (
+                    re.sub(r"[^a-zA-Z0-9_.-]+", "_", installed_version).strip("_")
+                    or "unknown"
+                )
                 versioned_key = f"{Keys.Tokenizer.CHAT_TEMPLATE}.{safe_version}.bak"
                 updates[versioned_key] = existing_template
                 # Maintain standard .backup key pointing to previous version
@@ -1260,7 +1309,10 @@ def patch_gguf(target_path: Path, minified_template: str, force: bool = False) -
 
         success = gguf_set_metadata(target_path, updates)
         if not success:
-            print(f"Error: Failed to update GGUF metadata in '{target_path}'.", file=sys.stderr)
+            print(
+                f"Error: Failed to update GGUF metadata in '{target_path}'.",
+                file=sys.stderr,
+            )
             sys.exit(1)
 
         print(f"Updated '{Keys.Tokenizer.CHAT_TEMPLATE}' in '{target_path}'")
@@ -1278,7 +1330,10 @@ def uninstall_gguf(
     """Uninstall the chat template from the GGUF file and restore from backup."""
     target_path = Path(target_path)
     if not target_path.is_file():
-        print(f"Error: Target path '{target_path}' is not a regular file.", file=sys.stderr)
+        print(
+            f"Error: Target path '{target_path}' is not a regular file.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     if not is_gguf_file(target_path):
@@ -1334,18 +1389,27 @@ def uninstall_gguf(
                 removals=removals,
             )
             if not success:
-                print(f"Error: Failed to restore backup in GGUF file '{target_path}'.", file=sys.stderr)
+                print(
+                    f"Error: Failed to restore backup in GGUF file '{target_path}'.",
+                    file=sys.stderr,
+                )
                 sys.exit(1)
             restored_template = extract_gguf_chat_template(target_path)
             remaining_backup = extract_gguf_backup(target_path)
             remaining_dist = extract_gguf_dist(target_path)
-            if restored_template != dist_template or remaining_backup is not None or remaining_dist is not None:
+            if (
+                restored_template != dist_template
+                or remaining_backup is not None
+                or remaining_dist is not None
+            ):
                 print(
                     f"Error: GGUF uninstall verification failed for '{target_path}'.",
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            print(f"Restored '{Keys.Tokenizer.CHAT_TEMPLATE}' from backup and removed backup key in '{target_path}'")
+            print(
+                f"Restored '{Keys.Tokenizer.CHAT_TEMPLATE}' from backup and removed backup key in '{target_path}'"
+            )
             return True
         except Exception as e:
             print(f"Error while restoring GGUF backup metadata: {e}", file=sys.stderr)
@@ -1374,7 +1438,9 @@ def uninstall_gguf(
         remaining_versions = [v for v in downgrade_versions if v != choice]
         if remaining_versions:
             latest_rem = remaining_versions[-1]
-            latest_tpl = extract_gguf_metadata(target_path, f"{Keys.Tokenizer.CHAT_TEMPLATE}.{latest_rem}.bak")
+            latest_tpl = extract_gguf_metadata(
+                target_path, f"{Keys.Tokenizer.CHAT_TEMPLATE}.{latest_rem}.bak"
+            )
             if latest_tpl:
                 updates[f"{Keys.Tokenizer.CHAT_TEMPLATE}.backup"] = latest_tpl
         else:
@@ -1385,7 +1451,10 @@ def uninstall_gguf(
         try:
             success = gguf_set_metadata(target_path, updates, removals=removals)
             if not success:
-                print(f"Error: Failed to downgrade GGUF metadata in '{target_path}'.", file=sys.stderr)
+                print(
+                    f"Error: Failed to downgrade GGUF metadata in '{target_path}'.",
+                    file=sys.stderr,
+                )
                 sys.exit(1)
 
             restored_template = extract_gguf_chat_template(target_path)
@@ -1396,7 +1465,9 @@ def uninstall_gguf(
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            print(f"Downgraded '{Keys.Tokenizer.CHAT_TEMPLATE}' to version '{choice}' in '{target_path}'")
+            print(
+                f"Downgraded '{Keys.Tokenizer.CHAT_TEMPLATE}' to version '{choice}' in '{target_path}'"
+            )
             return True
         except Exception as e:
             print(f"Error while downgrading GGUF metadata: {e}", file=sys.stderr)
@@ -1472,19 +1543,27 @@ def verify_source(
 
     # 1. Version check
     ver = extract_template_version(content)
-    version_ok = (ver == expected_version)
+    version_ok = ver == expected_version
     ver_color = GREEN if version_ok else RED
     print(f"    Version detected: ........ {ver_color}{ver}{RESET}")
     if not version_ok:
-        print(f"      {RED}Mismatch: expected '{expected_version}'{RESET}", file=sys.stderr)
+        print(
+            f"      {RED}Mismatch: expected '{expected_version}'{RESET}",
+            file=sys.stderr,
+        )
 
     # 2. Content check
     if expected_content is not None:
-        content_ok = (content == expected_content)
+        content_ok = content == expected_content
         content_color = GREEN if content_ok else RED
-        print(f"    Exact content match: ..... {content_color}{'yes' if content_ok else 'NO'}{RESET}")
+        print(
+            f"    Exact content match: ..... {content_color}{'yes' if content_ok else 'NO'}{RESET}"
+        )
         if not content_ok:
-            print(f"      {RED}Mismatch: applied content does not match expected source content{RESET}", file=sys.stderr)
+            print(
+                f"      {RED}Mismatch: applied content does not match expected source content{RESET}",
+                file=sys.stderr,
+            )
     else:
         content_ok = True
 
@@ -1505,27 +1584,44 @@ def verify_source(
         mt = render_template(content, multi)
 
         n_terse = plain.count(MARKER)
-        terse_ok = (n_terse == 1)
+        terse_ok = n_terse == 1
         terse_color = GREEN if terse_ok else RED
-        print(f"    Terseness prompt: ........ {terse_color}{'yes' if terse_ok else f'NO (found {n_terse}x)'}{RESET}")
+        print(
+            f"    Terseness prompt: ........ {terse_color}{'yes' if terse_ok else f'NO (found {n_terse}x)'}{RESET}"
+        )
         if not terse_ok:
-            print(f"      {RED}Expected terseness marker '{MARKER}' exactly once, found {n_terse}x{RESET}", file=sys.stderr)
+            print(
+                f"      {RED}Expected terseness marker '{MARKER}' exactly once, found {n_terse}x{RESET}",
+                file=sys.stderr,
+            )
 
-        sys_ok = (SYSTEM_PROBE in sysd)
+        sys_ok = SYSTEM_PROBE in sysd
         sys_color = GREEN if sys_ok else RED
-        print(f"    Keeps system prompt: ..... {sys_color}{'yes' if sys_ok else 'NO'}{RESET}")
+        print(
+            f"    Keeps system prompt: ..... {sys_color}{'yes' if sys_ok else 'NO'}{RESET}"
+        )
         if not sys_ok:
-            print(f"      {RED}Expected custom system prompt '{SYSTEM_PROBE}' to be preserved{RESET}", file=sys.stderr)
+            print(
+                f"      {RED}Expected custom system prompt '{SYSTEM_PROBE}' to be preserved{RESET}",
+                file=sys.stderr,
+            )
 
         think_ok = think_kept(mt)
         think_color = GREEN if think_ok else RED
-        print(f"    Retains thinking: ........ {think_color}{'yes' if think_ok else 'NO'}{RESET}")
+        print(
+            f"    Retains thinking: ........ {think_color}{'yes' if think_ok else 'NO'}{RESET}"
+        )
         if not think_ok:
-            print(f"      {RED}Expected multi-turn thinking tags to be retained{RESET}", file=sys.stderr)
+            print(
+                f"      {RED}Expected multi-turn thinking tags to be retained{RESET}",
+                file=sys.stderr,
+            )
 
         for model_name in ("Nail-35b-a3b", "Dagger-27b"):
             if model_name in plain:
-                print(f"    {YELLOW}Warning: names specific model '{model_name}'.{RESET}")
+                print(
+                    f"    {YELLOW}Warning: names specific model '{model_name}'.{RESET}"
+                )
 
         render_ok = terse_ok and sys_ok and think_ok
     except Exception as e:
@@ -1547,12 +1643,18 @@ def verify_directory(
         print(f"Error: Target '{target_dir}' is not a directory.", file=sys.stderr)
         return False
 
-    if isinstance(source_template_path, (str, Path)) and Path(source_template_path).is_file():
+    if (
+        isinstance(source_template_path, (str, Path))
+        and Path(source_template_path).is_file()
+    ):
         source_template_content = Path(source_template_path).read_text(encoding="utf-8")
     elif isinstance(source_template_path, str):
         source_template_content = source_template_path
     else:
-        print(f"Error: Invalid source template path: {source_template_path}", file=sys.stderr)
+        print(
+            f"Error: Invalid source template path: {source_template_path}",
+            file=sys.stderr,
+        )
         return False
 
     expected_version = extract_template_version(source_template_content)
@@ -1562,11 +1664,17 @@ def verify_directory(
     config_file = target_dir / "tokenizer_config.json"
 
     if not jinja_file.is_file():
-        print(f"{RED}Error: Missing '{SOURCE_TEMPLATE_NAME}' in '{target_dir}'.{RESET}", file=sys.stderr)
+        print(
+            f"{RED}Error: Missing '{SOURCE_TEMPLATE_NAME}' in '{target_dir}'.{RESET}",
+            file=sys.stderr,
+        )
         return False
 
     if not config_file.is_file():
-        print(f"{RED}Error: Missing 'tokenizer_config.json' in '{target_dir}'.{RESET}", file=sys.stderr)
+        print(
+            f"{RED}Error: Missing 'tokenizer_config.json' in '{target_dir}'.{RESET}",
+            file=sys.stderr,
+        )
         return False
 
     applied_jinja = jinja_file.read_text(encoding="utf-8")
@@ -1574,12 +1682,17 @@ def verify_directory(
         with open(config_file, "r", encoding="utf-8") as f:
             config_data = json.load(f)
     except Exception as e:
-        print(f"{RED}Error: Failed to parse '{config_file}': {e}{RESET}", file=sys.stderr)
+        print(
+            f"{RED}Error: Failed to parse '{config_file}': {e}{RESET}", file=sys.stderr
+        )
         return False
 
     applied_config = config_data.get("chat_template")
     if not isinstance(applied_config, str):
-        print(f"{RED}Error: Missing or invalid 'chat_template' in '{config_file}'.{RESET}", file=sys.stderr)
+        print(
+            f"{RED}Error: Missing or invalid 'chat_template' in '{config_file}'.{RESET}",
+            file=sys.stderr,
+        )
         return False
 
     print(f"\n{BOLD}{CYAN}=== Verifying Directory Chat Templates ==={RESET}")
@@ -1601,16 +1714,24 @@ def verify_directory(
     try:
         probe_jinja = render_probe(applied_jinja)
         probe_config = render_probe(applied_config)
-        same_render = (probe_jinja == probe_config)
+        same_render = probe_jinja == probe_config
     except Exception as e:
-        print(f"\n  {RED}Error during equivalence probe rendering: {e}{RESET}", file=sys.stderr)
+        print(
+            f"\n  {RED}Error during equivalence probe rendering: {e}{RESET}",
+            file=sys.stderr,
+        )
         same_render = False
 
     print("\n" + "-" * 50)
     if same_render:
-        print(f"  {GREEN}✅ Equivalence check passed: Both sources render identical prompts across all probe cases.{RESET}\n")
+        print(
+            f"  {GREEN}✅ Equivalence check passed: Both sources render identical prompts across all probe cases.{RESET}\n"
+        )
     else:
-        print(f"  {RED}❌ EQUIVALENCE MISMATCH: chat_template.jinja and tokenizer_config.json render differently!{RESET}\n", file=sys.stderr)
+        print(
+            f"  {RED}❌ EQUIVALENCE MISMATCH: chat_template.jinja and tokenizer_config.json render differently!{RESET}\n",
+            file=sys.stderr,
+        )
 
     return jinja_ok and config_ok and same_render
 
@@ -1631,12 +1752,18 @@ def verify_gguf(
         print(f"Error: Target '{target_path}' is not a regular file.", file=sys.stderr)
         return False
 
-    if isinstance(source_template_path, (str, Path)) and Path(source_template_path).is_file():
+    if (
+        isinstance(source_template_path, (str, Path))
+        and Path(source_template_path).is_file()
+    ):
         source_template_content = Path(source_template_path).read_text(encoding="utf-8")
     elif isinstance(source_template_path, str):
         source_template_content = source_template_path
     else:
-        print(f"Error: Invalid source template path: {source_template_path}", file=sys.stderr)
+        print(
+            f"Error: Invalid source template path: {source_template_path}",
+            file=sys.stderr,
+        )
         return False
 
     expected_version = extract_template_version(source_template_content)
@@ -1647,7 +1774,10 @@ def verify_gguf(
         reader = gguf.GGUFReader(target_path, "r")
         field = reader.get_field("tokenizer.chat_template")
         if field is None:
-            print(f"{RED}Error: Missing 'tokenizer.chat_template' in '{target_path}'.{RESET}", file=sys.stderr)
+            print(
+                f"{RED}Error: Missing 'tokenizer.chat_template' in '{target_path}'.{RESET}",
+                file=sys.stderr,
+            )
             return False
         val = field.contents()
         if isinstance(val, str):
@@ -1657,7 +1787,10 @@ def verify_gguf(
         else:
             applied_template = str(val)
     except Exception as e:
-        print(f"{RED}Error: Failed to read GGUF file '{target_path}': {e}{RESET}", file=sys.stderr)
+        print(
+            f"{RED}Error: Failed to read GGUF file '{target_path}': {e}{RESET}",
+            file=sys.stderr,
+        )
         return False
     finally:
         if reader is not None:
@@ -1678,7 +1811,10 @@ def verify_gguf(
     if ok:
         print(f"  {GREEN}✅ GGUF chat template verified successfully.{RESET}\n")
     else:
-        print(f"  {RED}❌ GGUF chat template verification failed.{RESET}\n", file=sys.stderr)
+        print(
+            f"  {RED}❌ GGUF chat template verification failed.{RESET}\n",
+            file=sys.stderr,
+        )
 
     return ok
 
@@ -1737,7 +1873,9 @@ def main(argv: list[str] | None = None) -> int:
         if selected_ggufs is not None:
             if args.uninstall:
                 target_ver = getattr(args, "target_version", None)
-                backed_up_ggufs = [gf for gf in selected_ggufs if get_gguf_backup_versions(gf)]
+                backed_up_ggufs = [
+                    gf for gf in selected_ggufs if get_gguf_backup_versions(gf)
+                ]
                 if not backed_up_ggufs:
                     print(
                         "Error: No backup chat template found in the selected cached Hugging Face GGUF file(s).",
@@ -1745,7 +1883,9 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     return 1
                 for gf in backed_up_ggufs:
-                    if not uninstall_gguf(gf, force=args.force, target_version=target_ver):
+                    if not uninstall_gguf(
+                        gf, force=args.force, target_version=target_ver
+                    ):
                         return 1
                 if len(backed_up_ggufs) == 1:
                     print(
@@ -1756,7 +1896,11 @@ def main(argv: list[str] | None = None) -> int:
                         f"Successfully restored the original chat template in {len(backed_up_ggufs)} cached Hugging Face GGUF files."
                     )
                 return 0
-            target_snap = hf_snapshot_path if hf_snapshot_path is not None else selected_ggufs[0].parent
+            target_snap = (
+                hf_snapshot_path
+                if hf_snapshot_path is not None
+                else selected_ggufs[0].parent
+            )
             if not handle_snapshot_surgery(target_snap, force=args.force):
                 return 1
             template_content = SOURCE_TEMPLATE_PATH.read_text(encoding="utf-8")
@@ -1777,7 +1921,9 @@ def main(argv: list[str] | None = None) -> int:
         if target_path.is_dir():
             if args.uninstall:
                 target_ver = getattr(args, "target_version", None)
-                if not uninstall_directory(target_path, force=args.force, target_version=target_ver):
+                if not uninstall_directory(
+                    target_path, force=args.force, target_version=target_ver
+                ):
                     return 1
                 print("Successfully uninstalled chat template from directory.")
                 return 0
@@ -1793,7 +1939,9 @@ def main(argv: list[str] | None = None) -> int:
         elif is_gguf_file(target_path):
             if args.uninstall:
                 target_ver = getattr(args, "target_version", None)
-                if not uninstall_gguf(target_path, force=args.force, target_version=target_ver):
+                if not uninstall_gguf(
+                    target_path, force=args.force, target_version=target_ver
+                ):
                     return 1
                 print("Successfully uninstalled chat template from GGUF.")
                 return 0

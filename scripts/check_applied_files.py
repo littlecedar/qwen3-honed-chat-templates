@@ -10,10 +10,10 @@ Examples:
     python3 scripts/check_applied.py /models/qwen3.8-27b.gguf
 """
 
-import sys
+import json
 import os
 import re
-import json
+import sys
 
 GREEN = "\033[92m"
 RED = "\033[91m"
@@ -59,7 +59,7 @@ def inspect_gguf(path: str):
         except Exception:
             pass
         return None
-    except Exception as e:
+    except Exception:
         return None
 
 

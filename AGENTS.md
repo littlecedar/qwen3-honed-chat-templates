@@ -13,10 +13,13 @@ This document provides project-specific architecture, build, testing, and debugg
   - `gguf>=0.19.0`: GGUF format parsing and binary metadata manipulation.
   - `jinja2>=3.1.6`: Chat template rendering, evaluation, and AST inspection.
   - `numpy>=2.5.3`: Mock tensor generation and array comparisons in test fixtures.
-  - `pytest`: Automated test runner.
+- **Development & Toolchain Dependencies**:
+  - `pytest>=8.0.0`: Automated test runner.
+  - `ruff>=0.16.0`: Rust-native Python linter and code formatter.
+  - `ty>=0.0.80`: Fast static type checker.
 
 ### Initial Setup
-Sync the virtual environment using `uv`:
+Sync the virtual environment (including development dependencies) using `uv`:
 ```bash
 uv sync
 ```
@@ -25,7 +28,7 @@ Alternatively, with standard `venv` and `pip`:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
-pip install pytest
+pip install pytest ruff ty
 ```
 
 ### Key Artifacts & Project Layout
@@ -55,6 +58,21 @@ uv run pytest tests/test_install.py -k test_directory_patch_success_with_existin
 
 # Alternatively using unittest
 uv run python -m unittest discover tests
+```
+
+#### Static Analysis & Type Checking
+```bash
+# Run Ruff lint check across all files
+uv run ruff check .
+
+# Check formatting without modifying files
+uv run ruff format --check .
+
+# Automatically apply Ruff formatting
+uv run ruff format .
+
+# Run Ty static type checker
+uv run ty check
 ```
 
 > **Important (Import Resolution)**: The repository root is not packaged into `site-packages`. When creating new test files under `tests/`, either execute with `PYTHONPATH=.` or ensure `sys.path.insert(0, str(REPO_ROOT))` is executed before importing `install` or `scripts.*`.
@@ -122,7 +140,9 @@ TEMPLATE_PATH = REPO_ROOT / "chat_template.jinja"
 
 class TestChatTemplateDemonstration(unittest.TestCase):
     def setUp(self):
-        self.assertTrue(TEMPLATE_PATH.is_file(), "chat_template.jinja must exist at repository root")
+        self.assertTrue(
+            TEMPLATE_PATH.is_file(), "chat_template.jinja must exist at repository root"
+        )
         self.source_template = TEMPLATE_PATH.read_text(encoding="utf-8")
 
     def test_minify_jinja_preserves_terse_marker(self):
@@ -189,7 +209,8 @@ uv run python scripts/check_applied_chatting.py /path/to/model_or_file.gguf
 ```
 
 ### Code Style & Quality Standards
-- **Python**: PEP 8 compliance, 4-space indentation, descriptive docstrings on test methods outlining PASS/FAIL criteria.
-- **Type Annotations**: Use modern Python 3.12+ syntax (`from __future__ import annotations`, `str | None`, `list[dict]`).
+- **Python**: PEP 8 compliance, 4-space indentation, descriptive docstrings on test methods outlining PASS/FAIL criteria. Code formatting is enforced via `ruff format` (`line-length = 88`, double quotes).
+- **Linting**: Automated via Astral `ruff check` with standard syntax, flake8, and import sorting rules (`select = ["E", "F", "I"]`, `ignore = ["E501"]`).
+- **Type Checking**: Static typing validated via Astral `ty` (`uv run ty check`) configured for Python 3.12 target version, leveraging modern syntax (`from __future__ import annotations`, `str | None`, `list[dict]`).
 - **Linter**: Qodana configuration is defined in `qodana.yaml` targeting `jetbrains/qodana-python:2026.2`.
 - **Cleanup Policy**: Ensure scripts and tests remove temporary `.tmp` or test directories under all exit conditions (`try...finally`).

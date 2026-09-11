@@ -1,6 +1,6 @@
+import argparse
 import re
 import sys
-import argparse
 
 
 def minify_jinja(content):

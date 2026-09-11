@@ -1,8 +1,8 @@
+import json
 import os
 import pathlib
-import sys
 import re
-import json
+import sys
 import traceback
 
 try:

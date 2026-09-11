@@ -18,8 +18,8 @@ The checks exist because each of them has a real failure mode:
 from __future__ import annotations
 
 import difflib
-import re
 import pathlib
+import re
 import sys
 import urllib.request
 
@@ -58,9 +58,11 @@ def main() -> int:
     with urllib.request.urlopen(UPSTREAM, timeout=60) as r:
         up = r.read().decode()
     diff = [
-        l
-        for l in difflib.unified_diff(up.splitlines(), full.splitlines(), lineterm="")
-        if l.startswith(("+", "-")) and not l.startswith(("+++", "---"))
+        line
+        for line in difflib.unified_diff(
+            up.splitlines(), full.splitlines(), lineterm=""
+        )
+        if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
     ]
     # v22.3.1 is froggeric v22.3 + the terseness append + the fast-mode fixes (Fix 3 + the
     # thinking-on/off terseness-lead split), so it is NO LONGER a pure-insertion diff on v22.3:
@@ -71,7 +73,7 @@ def main() -> int:
     up_ver = up_ver.group(1) if up_ver else "?"
     check(up_ver == BASE, f"upstream is still the rebase base {BASE} (live: {up_ver})")
 
-    ins = [l for l in diff if l.startswith("+")]
+    ins = [line for line in diff if line.startswith("+")]
     check(
         len(ins) >= 11, f"terseness + fixes inserted (>=11 added lines, got {len(ins)})"
     )

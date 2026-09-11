@@ -129,7 +129,7 @@ def report(label: str, src: str) -> bool:
         print(
             f"     WARNING: names a specific model ({d['identity']}) — you probably want the"
         )
-        print(f"              model-agnostic template from this repo instead")
+        print("              model-agnostic template from this repo instead")
     return ok
 
 
