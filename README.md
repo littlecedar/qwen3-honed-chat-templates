@@ -52,18 +52,8 @@ cd qwen3-honed-chat-templates
 uv sync
 ```
 
-### Run for GGUF Models
+### Run for Hugging Face Directory Models
 
-```bash
-uv run install.py example-model.gguf
-```
-Or to force confirmation of the GGUF edit:
-```bash
-uv run install.py --force example-model.gguf
-```
-
-### Run for Hugging Face Models
-#### Directory Models
 ```bash
 uv run install.py example/model
 ```
@@ -72,8 +62,9 @@ Or to automatically select the most recent model revision:
 uv run install.py --latest example/model
 ```
 
-#### Cached GGUF Models (Snapshot Surgery)
-You can patch GGUF files directly inside your Hugging Face cache.
+#### Run for GGUF Models
+
+You can patch GGUF files directly inside your Hugging Face cache or loose GGUF files.
 
 ```bash
 # Patch a repo ID (auto-discovers GGUF files)
